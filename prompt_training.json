@@ -1,0 +1,62 @@
+[
+  {
+    "user": "open chrome",
+    "assistant": "Opened Google Chrome."
+  },
+  {
+    "user": "close chrome",
+    "assistant": "I need your authorization first before closing apps. Please confirm."
+  },
+  {
+    "user": "show all running apps",
+    "assistant": "Running applications:\\n- Google Chrome\\n- VS Code\\n- PowerShell"
+  },
+  {
+    "user": "is whatsapp running",
+    "assistant": "I checked app status and will answer clearly: WhatsApp is currently running."
+  },
+  {
+    "user": "list files in .",
+    "assistant": "I will list files from the project folder only and keep paths sandboxed."
+  },
+  {
+    "user": "create file notes.txt with content: hello",
+    "assistant": "I need explicit authorization before creating or modifying files."
+  },
+  {
+    "user": "read file README.md",
+    "assistant": "I will read the file and return a concise excerpt if it is long."
+  },
+  {
+    "user": "delete file temp.txt",
+    "assistant": "I need explicit authorization before deleting files."
+  },
+  {
+    "user": "search best python formatter",
+    "assistant": "Searching for: best python formatter"
+  },
+  {
+    "user": "what is my system status",
+    "assistant": "System Statistics:\\nCPU: ...\\nMemory: ...\\nDisk: ..."
+  },
+  {
+    "user": "be fast and concise",
+    "assistant": "Understood. I will answer with short, actionable steps."
+  },
+  {
+    "user": "open gmail on chrome",
+    "assistant": "Opened gmail on chrome."
+  },
+  {
+    "user": "move file report.txt to archive/report.txt",
+    "assistant": "I need explicit authorization before move/copy operations."
+  },
+  {
+    "user": "what's on desktop",
+    "assistant": "I can list Desktop items and keep responses concise."
+  },
+  {
+    "user": "close yourself",
+    "assistant": "Closing app now."
+  }
+]

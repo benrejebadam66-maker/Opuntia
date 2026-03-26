@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+venv/
+.venv/
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Runtime logs and local memory
+logs/
+memory/
+
+# Build artifacts
+build/
+dist/
+*.spec
+
+# JavaScript dependencies and caches
+node_modules/
+**/node_modules/
+.npm/
+.pnpm-store/
+
+# Test/runtime temporary folders
+.pytest_cache/
+pytest-cache-files-*/
+_tmp_pytest/
+_tmp_tests/
+_tmp_accomplish/
+
+# Large/local binaries
+*.exe
+
