@@ -109,7 +109,7 @@ class AIAgentWindow(QMainWindow):
         self.setAttribute(Qt.WA_StyledBackground, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setAcceptDrops(True)
-        app_icon_path = os.path.join(resource_dir, "Opuntia logo 500px.png")
+        app_icon_path = self._resolve_asset_path("Opuntia logo 500px.png")
         if os.path.exists(app_icon_path):
             self.setWindowIcon(QIcon(app_icon_path))
         screen = QGuiApplication.primaryScreen()
@@ -346,11 +346,22 @@ class AIAgentWindow(QMainWindow):
     def _get_resource_dir(self):
         return getattr(sys, "_MEIPASS", self._get_app_dir())
 
+    def _resolve_asset_path(self, filename):
+        base_dir = self._get_resource_dir()
+        candidates = [
+            os.path.join(base_dir, "Vector images & icons", filename),
+            os.path.join(base_dir, filename),
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                return path
+        return candidates[0]
+
     def init_ui(self):
         assets_dir = self._get_resource_dir()
 
         def _icon_pixmap_from_file(filename, size, tint_hex=None):
-            path = os.path.join(assets_dir, filename)
+            path = self._resolve_asset_path(filename)
             pix = QPixmap(path)
             if pix.isNull():
                 return QPixmap()

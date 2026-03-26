@@ -24,6 +24,18 @@ def _get_resource_dir():
     return getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
 
 
+def _resolve_resource_path(filename):
+    base_dir = _get_resource_dir()
+    candidates = [
+        os.path.join(base_dir, "Vector images & icons", filename),
+        os.path.join(base_dir, filename),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return candidates[0]
+
+
 class MessageBubble(QWidget):
     def __init__(self, text, is_user=True):
         super().__init__()
@@ -405,9 +417,8 @@ class FeedbackRow(QWidget):
                 "QPushButton:hover { background-color: rgba(255, 255, 255, 0.14); }"
             )
 
-        base_dir = _get_resource_dir()
-        good_icon_path = os.path.join(base_dir, "Vector Good.png")
-        bad_icon_path = os.path.join(base_dir, "Vector Bad.png")
+        good_icon_path = _resolve_resource_path("Vector Good.png")
+        bad_icon_path = _resolve_resource_path("Vector Bad.png")
 
         self.good_btn = QPushButton()
         self.good_btn.setCursor(Qt.PointingHandCursor)
@@ -645,8 +656,7 @@ class TitleBar(QWidget):
         layout.setAlignment(Qt.AlignVCenter)
 
         # Get the directory where the script is located
-        script_dir = _get_resource_dir()
-        logo_path = os.path.join(script_dir, "Opuntia logo 500px.png")
+        logo_path = _resolve_resource_path("Opuntia logo 500px.png")
 
         self.logo_label = QLabel()
         self.logo_label.setStyleSheet("padding-left: 16px;")

@@ -834,7 +834,8 @@ class WindowsAgent:
                 {"label": "Allow once", "description": "Execute this action now", "value": "allow"},
                 {"label": "Deny", "description": "Do not execute this action", "value": "deny"},
             ]
-        ttl = max(10, int(timeout_sec or self.permission_request_timeout_sec))
+        default_timeout = getattr(self, "permission_request_timeout_sec", 90)
+        ttl = max(10, int(timeout_sec or default_timeout))
         self.pending_question = {
             "id": req_id,
             "header": (header or "Permission Request").strip(),
@@ -1445,7 +1446,8 @@ class WindowsAgent:
 
     def _update_profile_domain(self, user_text):
         """Track what topics/domains the user asks about most."""
-        if not self.user_profile or not user_text:
+        profile = getattr(self, "user_profile", None)
+        if not profile or not user_text:
             return
         domain_keywords = {
             "coding": r'\b(code|python|javascript|bug|function|error|git|api|debug|script|class|variable)\b',
@@ -1455,11 +1457,11 @@ class WindowsAgent:
             "system": r'\b(open|close|file|folder|app|window|screen|desktop|install|delete|move|copy)\b',
             "math": r'\b(calculate|math|equation|formula|convert|percentage|sum|average)\b',
         }
-        domains = self.user_profile.get("domains", {})
+        domains = profile.get("domains", {})
         for domain, pattern in domain_keywords.items():
             if re.search(pattern, user_text, re.IGNORECASE):
                 domains[domain] = domains.get(domain, 0) + 1
-        self.user_profile["domains"] = domains
+        profile["domains"] = domains
         # No save here — saved at session end to avoid disk thrash
 
     def _build_profile_prompt(self):
@@ -6548,7 +6550,7 @@ class WindowsAgent:
             location = "Desktop" if os.path.normcase(os.path.dirname(path)) == os.path.normcase(self.desktop_root) else os.path.dirname(path)
             word_count = len(decoded.split()) if decoded.strip() else 0
             detail = f" ({word_count} words)" if word_count else ""
-            action = "Updated" if append else "Created"
+            action = "Updated file" if append else "Saved file"
             return (
                 f"**{action}** `{fname}` on {location}{detail}.\n"
                 f"Say **\"open {fname}\"** if you want to view it."
@@ -10100,7 +10102,7 @@ class WindowsAgent:
         if is_mutation and not allow_mutation:
             self._audit("file_mutation", "permission_requested", {"command": text[:300], "allow_desktop": bool(allow_desktop)})
             return self._set_pending_question(
-                "Permission Required",
+                "Authorization required",
                 "Allow this file operation?",
                 [
                     {"label": "Allow once", "description": "Execute this file operation now", "value": "allow"},
@@ -11255,6 +11257,30 @@ class WindowsAgent:
             return f"Attachment analysis failed: {e}"
 
     def process_command(self, user_input):
+        if not hasattr(self, "pending_question"):
+            self.pending_question = None
+        if not hasattr(self, "pending_confirmation"):
+            self.pending_confirmation = None
+        if not hasattr(self, "_pending_pdf_save"):
+            self._pending_pdf_save = None
+        if not hasattr(self, "_pending_doc_save"):
+            self._pending_doc_save = None
+        if not hasattr(self, "last_attachment_paths"):
+            self.last_attachment_paths = []
+        if not hasattr(self, "last_attachment_ts"):
+            self.last_attachment_ts = 0.0
+        if not hasattr(self, "web_universal_mode"):
+            self.web_universal_mode = False
+        if not hasattr(self, "web_research_auto"):
+            self.web_research_auto = False
+        if not hasattr(self, "last_live_web_query"):
+            self.last_live_web_query = ""
+        if not hasattr(self, "last_live_web_error"):
+            self.last_live_web_error = ""
+        if not hasattr(self, "last_structured_intent"):
+            self.last_structured_intent = ""
+        if not hasattr(self, "last_structured_payload"):
+            self.last_structured_payload = {}
         raw_input = (user_input or "").lstrip()
         self._set_ai_runtime(provider="local", model="rules", status="processing", error="")
         auth_prefix = "AUTH_OK::"
@@ -11272,6 +11298,13 @@ class WindowsAgent:
             allow_sensitive_fs = True
             raw_input = raw_input[len(auth_prefix):].lstrip()
             self._audit("authorization", "granted", {"command": raw_input[:300]})
+            # AUTH_OK is an explicit one-shot approval from the UI.
+            # If a prior pending permission prompt exists, do not let it
+            # intercept this command; execute the authorized command directly.
+            if getattr(self, "pending_question", None) is not None:
+                prev_id = (self.pending_question or {}).get("id", "")
+                self.pending_question = None
+                self._audit("permission_request", "superseded_by_auth", {"id": prev_id, "command": raw_input[:300]})
         attachment_paths = []
         if raw_input.startswith(attach_prefix):
             raw_input = raw_input[len(attach_prefix):]
@@ -12411,7 +12444,7 @@ class WindowsAgent:
                 return "Tell me which app to close. Example: close whatsapp"
             if not allow_sensitive_fs:
                 self._audit("close_app", "permission_requested", {"target": target, "command": user_input[:300]})
-                return self._set_pending_question(
+                prompt = self._set_pending_question(
                     "Permission Required",
                     f"Close '{target}' now?",
                     [
@@ -12422,6 +12455,7 @@ class WindowsAgent:
                     payload={"target": target},
                     on_deny="Close app cancelled.",
                 )
+                return "Authorization required before closing apps.\n" + prompt
             result = self.close_app(target)
             return result or f"Could not close {target}"
         # Prioritize launcher commands before status-intent parsing.
