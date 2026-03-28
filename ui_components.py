@@ -4,7 +4,7 @@ import os
 import re
 import sys
 
-from PyQt5.QtCore import Qt, QTimer, QRectF, QSize, QMimeData, QUrl, QPoint, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QRectF, QPointF, QSize, QMimeData, QUrl, QPoint, pyqtSignal
 from PyQt5.QtGui import QPainter, QPen, QBrush, QColor, QLinearGradient, QPainterPath, QRegion, QPixmap, QIcon, QImage, QDrag
 from PyQt5.QtWidgets import (
     QApplication,
@@ -419,6 +419,7 @@ class FeedbackRow(QWidget):
 
         good_icon_path = _resolve_resource_path("Vector Good.png")
         bad_icon_path = _resolve_resource_path("Vector Bad.png")
+        copy_icon_path = _resolve_resource_path("Vector copy icon.png")
 
         self.good_btn = QPushButton()
         self.good_btn.setCursor(Qt.PointingHandCursor)
@@ -436,18 +437,29 @@ class FeedbackRow(QWidget):
             self.bad_btn.setIcon(QIcon(QPixmap(bad_icon_path)))
             self.bad_btn.setIconSize(QSize(16, 16))
 
+        self.copy_btn = QPushButton()
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setToolTip("Copy")
+        self.copy_btn.setStyleSheet(_btn_style())
+        if os.path.exists(copy_icon_path):
+            self.copy_btn.setIcon(QIcon(QPixmap(copy_icon_path)))
+            self.copy_btn.setIconSize(QSize(16, 16))
+
         row_layout.addWidget(self.good_btn)
         row_layout.addWidget(self.bad_btn)
+        row_layout.addWidget(self.copy_btn)
         main = QHBoxLayout(self)
         main.setContentsMargins(0, 0, 0, 0)
         main.setSpacing(0)
         main.addWidget(row, 0, Qt.AlignLeft)
 
-    def set_handlers(self, on_good=None, on_bad=None):
+    def set_handlers(self, on_good=None, on_bad=None, on_copy=None):
         if on_good is not None:
             self.good_btn.clicked.connect(on_good)
         if on_bad is not None:
             self.bad_btn.clicked.connect(on_bad)
+        if on_copy is not None:
+            self.copy_btn.clicked.connect(on_copy)
 
     def set_selected(self, kind):
         if kind == "good":
@@ -599,7 +611,7 @@ class GlassRail(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
 
     def _resolve_color(self):
-        fallback = QColor(255, 255, 255, 13)
+        fallback = QColor(0, 0, 0, 51)
         glass_bg = getattr(self.window, "glass_bg", "")
         if isinstance(glass_bg, str):
             m = re.match(r"rgba\((\d+),\s*(\d+),\s*(\d+),\s*([0-9.]+)\)", glass_bg.strip())
@@ -613,6 +625,11 @@ class GlassRail(QWidget):
         painter = QPainter(self)
         painter.setCompositionMode(QPainter.CompositionMode_Source)
         painter.fillRect(self.rect(), self._resolve_color())
+        # Right border stroke.
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setPen(QPen(QColor(25, 25, 25), 1.0))
+        w = self.rect().width()
+        painter.drawLine(QPointF(w - 0.5, 0), QPointF(w - 0.5, self.rect().height()))
         painter.end()
 
 
@@ -625,9 +642,6 @@ class TitleBar(QWidget):
         self.icon_color = QColor("#BBBBBB")
 
         self.setFixedHeight(44)
-        self.setAutoFillBackground(True)
-        self.setAttribute(Qt.WA_StyledBackground, True)
-        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setStyleSheet(
             """
@@ -704,7 +718,7 @@ class TitleBar(QWidget):
         layout.addLayout(button_layout)
 
     def _resolve_topbar_color(self):
-        fallback = QColor(255, 255, 255, 13)  # ~0.05 alpha
+        fallback = QColor(0, 0, 0, 51)  # matches dark glass palette
         glass_bg = getattr(self.window, "glass_bg", "")
         color_src = glass_bg or getattr(self.window, "sidebar_color", "")
         if isinstance(color_src, str):
@@ -723,6 +737,10 @@ class TitleBar(QWidget):
         # Match the sidebar glass tone.
         painter.setCompositionMode(QPainter.CompositionMode_Source)
         painter.fillRect(rect, self.bg_color)
+        # Bottom border stroke.
+        painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
+        painter.setPen(QPen(QColor(25, 25, 25), 1.0))
+        painter.drawLine(QPointF(0, rect.height() - 0.5), QPointF(rect.width(), rect.height() - 0.5))
         painter.end()
 
     def _window_btn_icon(self, kind, size=16):

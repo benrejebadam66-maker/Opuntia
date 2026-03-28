@@ -126,12 +126,12 @@ class AIAgentWindow(QMainWindow):
         
         # Colors - glassmorphism palette
         self.bg_color = "#07091a"
-        self.glass_bg = "rgba(255, 255, 255, 0.08)"
-        self.glass_border = "1px solid rgba(255, 255, 255, 0.16)"
+        self.glass_bg = "rgba(0, 0, 0, 0.20)"
+        self.glass_border = "1px solid #191919"
         self.sidebar_color = self.glass_bg
         self.text_primary = "#FFFFFF"
         self.text_secondary = "#8A8A9A"
-        self.input_bg = "rgba(255, 255, 255, 0.08)"
+        self.input_bg = "rgba(0, 0, 0, 0.20)"
         self.glass_angle_deg = -45
         self.glass_intensity = 0.80
         self.glass_reflection = 1.0
@@ -477,7 +477,7 @@ class AIAgentWindow(QMainWindow):
         # === LEFT SIDEBAR: app rail + features panel ===
         sidebar = QWidget()
         sidebar.setFixedWidth(self.sidebar_expanded_width)
-        sidebar.setStyleSheet(f"background-color: {self.sidebar_color};")
+        sidebar.setStyleSheet(f"background-color: {self.sidebar_color}; border-right: {self.glass_border};")
         self.sidebar_widget = sidebar
         
         sidebar_layout = QVBoxLayout(sidebar)
@@ -700,9 +700,9 @@ class AIAgentWindow(QMainWindow):
             btn.setFixedHeight(44)
             btn.setStyleSheet("""
                 QPushButton {
-                    background: rgba(255, 255, 255, 0.08);
+                    background: rgba(0, 0, 0, 0.20);
                     color: rgba(255, 255, 255, 0.80);
-                    border: none;
+                    border: 1px solid #191919;
                     border-radius: 22px;
                     padding: 0 22px;
                     font-family: 'Poppins';
@@ -710,9 +710,9 @@ class AIAgentWindow(QMainWindow):
                     font-weight: 500;
                 }
                 QPushButton:hover {
-                    background: rgba(255, 255, 255, 0.14);
+                    background: rgba(0, 0, 0, 0.30);
                     color: rgba(255, 255, 255, 0.95);
-                    border: none;
+                    border: 1px solid #191919;
                 }
             """)
 
@@ -861,7 +861,7 @@ class AIAgentWindow(QMainWindow):
             QWidget#input_container {{
                 background: {self.glass_bg};
                 border-radius: 20px;
-                border: none;
+                border: {self.glass_border};
             }}
         """)
 
@@ -1206,7 +1206,7 @@ class AIAgentWindow(QMainWindow):
         # Paint the frosted glass fill only inside the rounded path.
         painter.setCompositionMode(QPainter.CompositionMode_SourceOver)
         painter.setClipPath(panel_path)
-        painter.fillRect(panel_rect, QColor(30, 30, 32, 195))
+        painter.fillRect(panel_rect, QColor(0, 0, 0, 51))
 
         # No border stroke to avoid extra top/bottom hairlines.
 
@@ -2979,21 +2979,9 @@ class AIAgentWindow(QMainWindow):
         """Style mode buttons — active gets white fill, inactive stays subtle."""
         _btn_active = """
             QPushButton {
-                background: rgba(255, 255, 255, 0.18);
+                background: rgba(0, 0, 0, 0.38);
                 color: rgba(255, 255, 255, 0.95);
-                border: none;
-                border-radius: 22px;
-                padding: 0 22px;
-                font-family: 'Poppins';
-                font-size: 14px;
-                font-weight: 500;
-            }
-        """
-        _btn_inactive = """
-            QPushButton {
-                background: rgba(255, 255, 255, 0.08);
-                color: rgba(255, 255, 255, 0.60);
-                border: none;
+                border: 1px solid #191919;
                 border-radius: 22px;
                 padding: 0 22px;
                 font-family: 'Poppins';
@@ -3001,8 +2989,26 @@ class AIAgentWindow(QMainWindow):
                 font-weight: 500;
             }
             QPushButton:hover {
-                background: rgba(255, 255, 255, 0.14);
+                background: rgba(0, 0, 0, 0.46);
+                color: rgba(255, 255, 255, 1.0);
+                border: 1px solid #191919;
+            }
+        """
+        _btn_inactive = """
+            QPushButton {
+                background: rgba(0, 0, 0, 0.20);
+                color: rgba(255, 255, 255, 0.60);
+                border: 1px solid #191919;
+                border-radius: 22px;
+                padding: 0 22px;
+                font-family: 'Poppins';
+                font-size: 14px;
+                font-weight: 500;
+            }
+            QPushButton:hover {
+                background: rgba(0, 0, 0, 0.30);
                 color: rgba(255, 255, 255, 0.95);
+                border: 1px solid #191919;
             }
         """
         is_chat = self.current_mode == "chat"
@@ -3211,7 +3217,10 @@ class AIAgentWindow(QMainWindow):
         def on_bad():
             self._submit_feedback("bad", assistant_text, row=row)
 
-        row.set_handlers(on_good=on_good, on_bad=on_bad)
+        def on_copy():
+            QApplication.clipboard().setText(assistant_text or "")
+
+        row.set_handlers(on_good=on_good, on_bad=on_bad, on_copy=on_copy)
         if bubble is not None and hasattr(bubble, "set_footer"):
             bubble.set_footer(row)
         else:
