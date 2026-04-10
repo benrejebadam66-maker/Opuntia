@@ -15852,7 +15852,7 @@ class WindowsAgent:
             r'|capture\s+(?:screen|window)|take\s+(?:a\s+)?screenshot'
             r'|create|make|write|save|generate|build|produce|export|convert'
             r'|navigate|go\s+to|open\s+(?:folder|directory|path|file)'
-            r'|search\s+(?:for\s+)?(?:files?|folder|document)|find\s+(?:file|folder|document)'
+            r'|search\s+(?:for\s+)?(?:files?|folder|document)|search\s+\w+\s+on\s+\w+|find\s+(?:file|folder|document)'
             r'|set\s+(volume|brightness|alarm|timer|reminder)'
             r'|install|uninstall|download|upload'
             r'|send\s+(?:an?\s+)?(?:email|message|mail)'

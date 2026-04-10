@@ -97,7 +97,7 @@ def _make_agent(tmp_root):
     agent.last_live_web_error = ""
     agent.screen_sharing_active = False
     agent.fast_prompt_mode = True
-    agent.input_mode = "chat"
+    agent.input_mode = "task"
     agent.search_tool_types = {k: True for k in ("info","image","news","api","tool","data","research","video","shopping")}
     agent.openai_compat_base_url = ""
     agent.openai_compat_api_key = ""
