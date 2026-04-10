@@ -140,27 +140,26 @@ def _try_uia(
     """
     Delegate to the engine's existing UIA execution layer.
     Imports engine.execution.actions to reuse InvokePattern/ValuePattern logic.
+    execute_action is async — we run it synchronously in a fresh thread to
+    avoid re-entrancy issues when called from a sync context.
     """
     try:
         import asyncio
+        import concurrent.futures
         from engine.execution.actions import execute_action as _uia_execute
-        # execute_action is async — run synchronously inside the router
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                # Already inside an event loop — schedule as a task
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    future = pool.submit(
-                        asyncio.run,
-                        _uia_execute(action, element_map),
-                    )
-                    return future.result(timeout=action.timeout_ms / 1000 + 1)
-            else:
-                return loop.run_until_complete(_uia_execute(action, element_map))
-        except Exception as exc:
-            logger.debug("UIA async execute error: %s", exc)
-            return None
+
+        def _run_in_thread() -> Optional[ActionResult]:
+            try:
+                return asyncio.run(
+                    _uia_execute(action, element_map, use_router=False)
+                )
+            except Exception as exc:
+                logger.debug("UIA async execute error: %s", exc)
+                return None
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(_run_in_thread)
+            return future.result(timeout=action.timeout_ms / 1000 + 2)
     except Exception as exc:
         logger.debug("_try_uia import/dispatch error: %s", exc)
     return None
