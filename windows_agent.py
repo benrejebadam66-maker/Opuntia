@@ -1,5 +1,6 @@
-import os
+﻿import os
 import json
+import hashlib
 from pathlib import Path
 import re
 import time
@@ -11,7 +12,6 @@ import requests
 import psutil
 import pyautogui
 import webbrowser
-import platform
 import base64
 import shutil
 import mimetypes
@@ -21,6 +21,36 @@ from urllib.parse import quote_plus, unquote, urlsplit
 from urllib import robotparser
 from io import BytesIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
+try:
+    from agents.hermes_memory_bridge import HermesMemoryBridge
+except Exception:
+    HermesMemoryBridge = None
+try:
+    from agents.memory_safety import validate_memory_text
+except Exception:
+    validate_memory_text = None
+try:
+    from agents.mcp_bridge import MCPBridge
+except Exception:
+    MCPBridge = None
+
+try:
+    from engine import perceive, execute_action, init_tracing
+    from engine.types import Action, ActionType, ElementMap
+    from engine.privacy.scanner import scan_elements_for_pii, redact_text
+    from engine.compat.input_control_bridge import InputControlBridge
+    _ENGINE_AVAILABLE = True
+except Exception:
+    perceive = None
+    execute_action = None
+    init_tracing = None
+    Action = None
+    ActionType = None
+    ElementMap = None
+    scan_elements_for_pii = None
+    redact_text = None
+    InputControlBridge = None
+    _ENGINE_AVAILABLE = False
 
 try:
     from groq import Groq
@@ -112,7 +142,10 @@ class WindowsAgent:
 
     def __init__(self):
         self.groq_api_key = (os.getenv("GROQ_API_KEY") or "").strip()
+        self.glm_api_key = (os.getenv("GLM_API_KEY") or "").strip()
+        self.mimo_api_key = (os.getenv("MIMO_API_KEY") or "").strip()
         self.openai_api_key = (os.getenv("OPENAI_API_KEY") or "").strip()
+        self.anthropic_api_key = (os.getenv("ANTHROPIC_API_KEY") or os.getenv("CLAUDE_API_KEY") or "").strip()
         self.deepseek_api_key = (os.getenv("DEEPSEEK_API_KEY") or "").strip()
         self.qwen_api_key = (os.getenv("ALIBABA_MODEL_STUDIO_API_KEY") or os.getenv("DASHSCOPE_API_KEY") or "").strip()
         self.gemini_api_key = (os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or "").strip()
@@ -123,12 +156,55 @@ class WindowsAgent:
         self.fast_prompt_mode = (os.getenv("FAST_PROMPT_MODE", "1").strip().lower() not in {"0", "false", "no", "off"})
         self.openai_search_model = os.getenv("OPENAI_SEARCH_MODEL", "gpt-4.1-mini")
         self.use_openai_builtin_search = (os.getenv("OPENAI_BUILTIN_SEARCH", "1").strip().lower() not in {"0", "false", "no", "off"})
+        self.openai_compat_base_url = (
+            os.getenv("OPENAI_COMPAT_BASE_URL")
+            or os.getenv("OPENAI_BASE_URL")
+            or os.getenv("LLM_BASE_URL")
+            or ""
+        ).strip()
+        self.openai_compat_api_key = (
+            os.getenv("OPENAI_COMPAT_API_KEY")
+            or os.getenv("LLM_API_KEY")
+            or self.openai_api_key
+            or ""
+        ).strip()
+        self.openai_compat_model = (
+            os.getenv("OPENAI_COMPAT_MODEL")
+            or os.getenv("OPENAI_MODEL")
+            or os.getenv("LLM_MODEL")
+            or "gpt-4o-mini"
+        ).strip()
+        self.openai_compat_fallback_models = [
+            m.strip()
+            for m in (
+                os.getenv("OPENAI_COMPAT_FALLBACK_MODELS")
+                or os.getenv("OPENAI_FALLBACK_MODELS")
+                or ""
+            ).split(",")
+            if m.strip()
+        ]
+        self.anthropic_base_url = (os.getenv("ANTHROPIC_BASE_URL") or "https://api.anthropic.com/v1/messages").strip()
+        self.anthropic_version = (os.getenv("ANTHROPIC_VERSION") or "2023-06-01").strip()
+        self.anthropic_model = (
+            os.getenv("ANTHROPIC_MODEL")
+            or os.getenv("CLAUDE_MODEL")
+            or "claude-3-5-sonnet-latest"
+        ).strip()
+        self.anthropic_fallback_models = [
+            m.strip()
+            for m in (
+                os.getenv("ANTHROPIC_FALLBACK_MODELS")
+                or os.getenv("CLAUDE_FALLBACK_MODELS")
+                or "claude-3-5-haiku-latest"
+            ).split(",")
+            if m.strip()
+        ]
         self.web_search_providers = [
             p.strip().lower()
             for p in (os.getenv("WEB_SEARCH_PROVIDERS", "ddg_lite,bing,google_html,ddg,bing_rss") or "").split(",")
             if p.strip()
         ]
-        self.web_use_playwright = (os.getenv("WEB_USE_PLAYWRIGHT", "0").strip().lower() not in {"0", "false", "no", "off"})
+        self.web_use_playwright = (os.getenv("WEB_USE_PLAYWRIGHT", "1").strip().lower() not in {"0", "false", "no", "off"})
         self.web_search_timeout_sec = int(os.getenv("WEB_SEARCH_TIMEOUT_SEC", "7"))
         self.live_web_prefetch_enabled = (os.getenv("LIVE_WEB_PREFETCH", "0").strip().lower() in {"1", "true", "yes", "on"})
         self.web_research_max_passes = int(os.getenv("WEB_RESEARCH_MAX_PASSES", "2"))
@@ -169,11 +245,21 @@ class WindowsAgent:
         self.search_trace_enabled = (os.getenv("SEARCH_TRACE_ENABLED", "0").strip().lower() in {"1", "true", "yes", "on"})
         
         # Browser tool configuration
-        self.browser_headless = (os.getenv("BROWSER_HEADLESS", "1").strip().lower() in {"1", "true", "yes", "on"})
+        self.browser_headless = (os.getenv("BROWSER_HEADLESS", "0").strip().lower() in {"1", "true", "yes", "on"})
         self.browser_timeout_ms = int(os.getenv("BROWSER_TIMEOUT_MS", "15000"))
         self.browser_wait_load_ms = int(os.getenv("BROWSER_WAIT_LOAD_MS", "3000"))
         self.browser_extract_images = (os.getenv("BROWSER_EXTRACT_IMAGES", "0").strip().lower() in {"1", "true", "yes", "on"})
         self.browser_extract_links = (os.getenv("BROWSER_EXTRACT_LINKS", "1").strip().lower() not in {"0", "false", "no", "off"})
+        # Persistent Playwright session — runs on a dedicated thread
+        self._pw_thread = None
+        self._pw_cmd_queue = None   # queue.Queue for sending commands to the thread
+        self._pw_res_queue = None   # queue.Queue for receiving results
+        self._pw_page = None        # proxy flag: None = browser not open
+        self._pw_browser_type = "chromium"  # active browser engine
+        self._pw_intercepted = []   # captured network requests
+        self._playwright_mode_active = False  # set True by UI when split-panel is open
+        self._pw_page_cache = None           # cached dict: url/title/text/scan
+        self._pw_page_cache_ts = 0.0         # epoch time of last cache fill
         
         # Source attribution
         self.source_attribution_enabled = (os.getenv("SOURCE_ATTRIBUTION", "1").strip().lower() not in {"0", "false", "no", "off"})
@@ -201,6 +287,12 @@ class WindowsAgent:
         ).strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
         self.gemini_fallback_models = [m.strip() for m in (os.getenv("GEMINI_FALLBACK_MODELS", "gemini-1.5-pro") or "").split(",") if m.strip()]
+        self.glm_model = os.getenv("GLM_MODEL", "glm-4-flash")
+        self.glm_fallback_models = ["glm-4-air", "glm-4"]
+        self.glm_base_url = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
+        self.mimo_model = os.getenv("MIMO_MODEL", "mimo-7b")
+        self.mimo_fallback_models = ["mimo-7b"]
+        self.mimo_base_url = os.getenv("MIMO_BASE_URL", "https://api.mimo.ai/v1/chat/completions")
         self.client = Groq(api_key=self.groq_api_key) if (Groq is not None and self.groq_api_key) else None
         self.response_temperature = 0.5
         self.response_top_p = 0.9
@@ -229,6 +321,14 @@ class WindowsAgent:
         self.memory_journal_file = os.path.join(self.memory_dir, "conversation_memory.jsonl")
         self.learned_facts_file = os.path.join(self.memory_dir, "learned_facts.json")
         self.adaptive_examples_file = os.path.join(self.memory_dir, "adaptive_examples.json")
+        self.session_recaps_file = os.path.join(self.memory_dir, "session_recaps.json")
+        self.task_outcomes_file = os.path.join(self.memory_dir, "task_outcomes.json")
+        self.trajectory_memory_file = os.path.join(self.memory_dir, "trajectory_memory.json")
+        self.provider_stats_file = os.path.join(self.memory_dir, "provider_stats.json")
+        self.mcp_servers_file = os.path.join(self.memory_dir, "mcp_servers.json")
+        self.mcp_route_stats_file = os.path.join(self.memory_dir, "mcp_route_stats.json")
+        self.mcp_repo_config_file = os.path.join(self.base_dir, "mcp_servers.json")
+        self.mcp_example_config_file = os.path.join(self.base_dir, "mcp_servers.example.json")
         self.settings_file = os.path.join(self.memory_dir, "settings.json")
         self.feedback_file = os.path.join(self.memory_dir, "feedback.jsonl")
         self.last_feedback_error = ""
@@ -237,10 +337,50 @@ class WindowsAgent:
         self.skills_registry_file = os.path.join(self.memory_dir, "skills_registry.json")
         self.user_profile_file = os.path.join(self.memory_dir, "user_profile.json")
         self.user_profile = {}
+        self.hermes_memory = None
+        if HermesMemoryBridge is not None:
+            self.hermes_memory = HermesMemoryBridge(
+                self.memory_dir,
+                max_items=int(os.getenv("HERMES_MEMORY_MAX_ITEMS", "400")),
+            )
+            self.hermes_memory.load()
+        self.mcp_bridge = None
+        self.mcp_enabled = (os.getenv("MCP_ENABLED", "1").strip().lower() not in {"0", "false", "no", "off"})
+        self.mcp_default_timeout_sec = int(os.getenv("MCP_DEFAULT_TIMEOUT_SEC", "25"))
+        self.mcp_default_server = (os.getenv("MCP_DEFAULT_SERVER", "filesystem") or "filesystem").strip().lower()
+        self.mcp_allowed_dirs_ttl_sec = int(os.getenv("MCP_ALLOWED_DIRS_TTL_SEC", "90"))
+        self.mcp_config_path = (
+            os.getenv("MCP_CONFIG_PATH")
+            or (self.mcp_servers_file if os.path.exists(self.mcp_servers_file) else "")
+            or (self.mcp_repo_config_file if os.path.exists(self.mcp_repo_config_file) else "")
+            or (self.mcp_example_config_file if os.path.exists(self.mcp_example_config_file) else self.mcp_servers_file)
+        )
+        if self.mcp_enabled and MCPBridge is not None:
+            self.mcp_bridge = MCPBridge(
+                config_path=self.mcp_config_path,
+                default_timeout_sec=self.mcp_default_timeout_sec,
+            )
         self.max_memory_items = int(os.getenv("MAX_MEMORY_ITEMS", "2000"))
         self.max_adaptive_examples = int(os.getenv("MAX_ADAPTIVE_EXAMPLES", "1200"))
+        self.max_session_recaps = int(os.getenv("MAX_SESSION_RECAPS", "120"))
+        self.session_recap_trigger = int(os.getenv("SESSION_RECAP_TRIGGER", "10"))
+        self.max_task_outcomes = int(os.getenv("MAX_TASK_OUTCOMES", "800"))
+        self.max_trajectories = int(os.getenv("MAX_TRAJECTORIES", "200"))
+        self.trajectory_compact_trigger = int(os.getenv("TRAJECTORY_COMPACT_TRIGGER", "12"))
         self.conversation_history = []
         self.task_conversation_history = []  # separate history for Task mode
+        self.session_recaps = []
+        self.task_outcomes = []
+        self.failure_patterns = {}
+        self.trajectory_memory = []
+        self._trajectory_source_cursor = 0
+        self.memory_safety_block_count = 0
+        self.provider_health = {}
+        self.provider_cooldown_until = {}
+        self.provider_last_error = {}
+        self.mcp_route_stats = {}
+        self._mcp_allowed_dirs_cache = []
+        self._mcp_allowed_dirs_ts = 0.0
         self.prompt_examples = []
         self.skills = []
         self.skill_enabled_map = {}
@@ -259,6 +399,12 @@ class WindowsAgent:
         self.screen_sharing_active = False  # True when current message carries a live screenshot
         self._screen_summary_cache = {}
         self._ai_response_cache = {}
+        self.last_user_message = ""
+        self.last_assistant_message = ""
+        self.topic_anchor_text = ""
+        self.topic_anchor_keywords = []
+        self.topic_anchor_updated_at = 0.0
+        self.topic_anchor_ttl_sec = int(os.getenv("TOPIC_ANCHOR_TTL_SEC", "900"))
         self.last_live_web_query = ""
         self.last_live_web_error = ""
         self.last_structured_intent = ""
@@ -279,8 +425,11 @@ class WindowsAgent:
         
         self.last_screen_action_plan = None
         self.pending_plan_execution = None
+        self.pending_workflow_plan = None
         self.pending_confirmation = None
         self.pending_question = None
+        self.autonomy_profile = (os.getenv("AUTONOMY_PROFILE", "balanced") or "balanced").strip().lower()
+        self.user_city = ""  # User-set home city, overrides IP detection in greeting
         self.permission_request_timeout_sec = int(os.getenv("PERMISSION_REQUEST_TIMEOUT_SEC", "90"))
         self.last_ai_runtime = {
             "provider": "local",
@@ -331,7 +480,12 @@ class WindowsAgent:
         self.memory_summary_keep_last = int(os.getenv("MEMORY_SUMMARY_KEEP_LAST", "6"))
         self._last_summary_ts = 0.0
         self._load_settings()
+        self._load_provider_stats()
+        self._load_mcp_route_stats()
         self.load_memory()
+        self.load_session_recaps()
+        self.load_task_outcomes()
+        self.load_trajectory_memory()
         self.load_prompt_examples()
         self.load_skills()
         self.load_long_term_learning()
@@ -340,9 +494,68 @@ class WindowsAgent:
         self.start_new_session()
         self.last_attachment_paths = []
         self.last_attachment_ts = 0.0
-        self._pending_doc_save = None  # {"temp_path": str, "name": str} â waiting for save location
-        self._pending_pdf_save = None  # {"content": str, "name": str, "doc_title": str} â waiting for save location
+        self._pending_doc_save = None  # {"temp_path": str, "name": str} Ã¢Â€Â” waiting for save location
+        self._pending_pdf_save = None  # {"content": str, "name": str, "doc_title": str} Ã¢Â€Â” waiting for save location
         self.input_mode = "chat"  # default mode; set to "task" when task prefix detected
+        # Engine integration (Phase 1) — perception, execution, PII, tracing
+        if init_tracing is not None:
+            try:
+                init_tracing()
+            except Exception:
+                pass
+        self._engine_fallback = None   # InputControlBridge; no raw dispatcher in this agent
+        self._last_elements = None     # Last ElementMap from structured UIA perception
+
+    # ------------------------------------------------------------------
+    # Engine-powered perception and action methods (Phase 1 integration)
+    # These supplement, never replace, the existing screenshot/pyautogui
+    # path. All fall back gracefully if the engine is unavailable.
+    # ------------------------------------------------------------------
+
+    async def get_structured_screen(self, app_name=None):
+        """Get structured UI elements via Windows UIA. Returns (ElementMap, pii_matches).
+
+        Does NOT replace _describe_screen_snapshot() — it supplements it.
+        The caller receives element IDs and labels alongside the visual frame.
+        """
+        if perceive is None:
+            return None, []
+        try:
+            elements = await perceive(app_name=app_name)
+            self._last_elements = elements
+            pii_matches = scan_elements_for_pii(elements.elements)
+            return elements, pii_matches
+        except Exception as e:
+            import logging
+            logging.warning("Engine perception failed, using screenshot only: %s", e)
+            return None, []
+
+    async def smart_click(self, element_id: str):
+        """Click element by UIA element ID; falls back to raw SendInput if UIA fails."""
+        if execute_action is None or self._last_elements is None:
+            return None
+        action = Action(action_type=ActionType.CLICK, element_id=element_id)
+        return await execute_action(
+            action, self._last_elements, fallback_dispatcher=self._engine_fallback
+        )
+
+    async def smart_type(self, element_id: str, text: str):
+        """Type text via UIA ValuePattern; falls back to raw keystroke injection."""
+        if execute_action is None or self._last_elements is None:
+            return None
+        action = Action(action_type=ActionType.TYPE, element_id=element_id, text=text)
+        return await execute_action(
+            action, self._last_elements, fallback_dispatcher=self._engine_fallback
+        )
+
+    async def smart_read(self, element_id: str):
+        """Read element text via UIA ValuePattern / TextPattern / Name."""
+        if execute_action is None or self._last_elements is None:
+            return None
+        action = Action(action_type=ActionType.READ, element_id=element_id)
+        return await execute_action(action, self._last_elements)
+
+    # ------------------------------------------------------------------
 
     def _call_deepseek_chat(self, messages, model_name):
         if not self.deepseek_api_key:
@@ -388,6 +601,66 @@ class WindowsAgent:
             return response.choices[0].message.content
         raise RuntimeError("Groq returned empty content.")
 
+    def _call_glm_chat(self, messages, model_name):
+        if not self.glm_api_key:
+            raise RuntimeError("GLM API key not configured.")
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": self.response_max_tokens,
+            "temperature": self.response_temperature,
+            "top_p": self.response_top_p,
+        }
+        response = requests.post(
+            self.glm_base_url,
+            headers={
+                "Authorization": f"Bearer {self.glm_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.ai_request_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"GLM error {response.status_code}: {response.text[:240]}")
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("GLM returned no choices.")
+        msg = (choices[0].get("message") or {}).get("content")
+        if not msg:
+            raise RuntimeError("GLM returned empty content.")
+        return msg
+
+    def _call_mimo_chat(self, messages, model_name):
+        if not self.mimo_api_key:
+            raise RuntimeError("Mimo API key not configured.")
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": self.response_max_tokens,
+            "temperature": self.response_temperature,
+            "top_p": self.response_top_p,
+        }
+        response = requests.post(
+            self.mimo_base_url,
+            headers={
+                "Authorization": f"Bearer {self.mimo_api_key}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.ai_request_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Mimo error {response.status_code}: {response.text[:240]}")
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("Mimo returned no choices.")
+        msg = (choices[0].get("message") or {}).get("content")
+        if not msg:
+            raise RuntimeError("Mimo returned empty content.")
+        return msg
+
     def _call_qwen_chat(self, messages, model_name):
         if not self.qwen_api_key:
             raise RuntimeError("Qwen/DashScope API key not configured.")
@@ -417,6 +690,100 @@ class WindowsAgent:
         if not msg:
             raise RuntimeError("Qwen returned empty content.")
         return msg
+
+    def _call_openai_compatible_chat(self, messages, model_name):
+        base = (self.openai_compat_base_url or "").strip()
+        if not base:
+            raise RuntimeError("OpenAI-compatible base URL not configured.")
+        payload = {
+            "model": model_name,
+            "messages": messages,
+            "max_tokens": self.response_max_tokens,
+            "temperature": self.response_temperature,
+            "top_p": self.response_top_p,
+        }
+        headers = {"Content-Type": "application/json"}
+        key = (self.openai_compat_api_key or "").strip()
+        if key:
+            headers["Authorization"] = f"Bearer {key}"
+        response = requests.post(
+            base,
+            headers=headers,
+            json=payload,
+            timeout=self.ai_request_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"OpenAI-compatible error {response.status_code}: {response.text[:260]}")
+        data = response.json()
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError("OpenAI-compatible backend returned no choices.")
+        msg = (choices[0].get("message") or {}).get("content")
+        if isinstance(msg, list):
+            text_parts = []
+            for part in msg:
+                if isinstance(part, dict) and part.get("type") == "text":
+                    text_parts.append(str(part.get("text") or ""))
+            msg = "\n".join([x for x in text_parts if x]).strip()
+        if not msg:
+            raise RuntimeError("OpenAI-compatible backend returned empty content.")
+        return str(msg).strip()
+
+    def _call_anthropic_chat(self, messages, model_name):
+        if not self.anthropic_api_key:
+            raise RuntimeError("Anthropic API key not configured.")
+        system_parts = []
+        converted = []
+        for m in messages or []:
+            role = (m.get("role") or "user").strip().lower()
+            content = m.get("content") or ""
+            if isinstance(content, list):
+                text_parts = []
+                for p in content:
+                    if isinstance(p, dict) and p.get("type") == "text":
+                        text_parts.append(str(p.get("text") or ""))
+                content = "\n".join([x for x in text_parts if x]).strip()
+            content = str(content).strip()
+            if not content:
+                continue
+            if role == "system":
+                system_parts.append(content)
+                continue
+            if role not in {"user", "assistant"}:
+                role = "user"
+            converted.append({"role": role, "content": content})
+        if not converted:
+            raise RuntimeError("Anthropic prompt is empty.")
+        payload = {
+            "model": model_name,
+            "max_tokens": int(self.response_max_tokens),
+            "messages": converted,
+        }
+        system_text = "\n\n".join(system_parts).strip()
+        if system_text:
+            payload["system"] = system_text[:12000]
+        response = requests.post(
+            self.anthropic_base_url,
+            headers={
+                "x-api-key": self.anthropic_api_key,
+                "anthropic-version": self.anthropic_version,
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=self.ai_request_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Anthropic error {response.status_code}: {response.text[:260]}")
+        data = response.json()
+        blocks = data.get("content") or []
+        texts = []
+        for b in blocks:
+            if isinstance(b, dict) and b.get("type") == "text":
+                texts.append(str(b.get("text") or ""))
+        out = "\n".join([x for x in texts if x]).strip()
+        if not out:
+            raise RuntimeError("Anthropic returned empty content.")
+        return out
 
     def _messages_to_plain_prompt(self, messages):
         lines = []
@@ -500,17 +867,50 @@ class WindowsAgent:
         ]
         return any(re.search(p, user_text, flags=re.IGNORECASE) for p in patterns)
 
+    def _normalize_for_prompt_cache(self, text):
+        raw = str(text or "")
+        if not raw:
+            return ""
+        # Remove highly volatile timestamps from system blocks.
+        raw = re.sub(
+            r"current date and time:\s*.*?(?:\n|$)",
+            "current date and time: <dynamic>",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        raw = re.sub(r"\d{2}:\d{2}:\d{2}", "<time>", raw)
+        raw = re.sub(r"\d{4}-\d{2}-\d{2}", "<date>", raw)
+        raw = re.sub(r"\s+", " ", raw.strip().lower())
+        return raw[:900]
+
     def _cache_key_from_messages(self, messages):
         try:
+            rows = list(messages or [])
+            if not rows:
+                return ""
             user = ""
-            for m in reversed(messages or []):
-                if m.get("role") == "user":
-                    user = (m.get("content") or "").strip().lower()
-                    break
+            system_parts = []
+            for m in rows:
+                role = (m.get("role") or "").strip().lower()
+                content = m.get("content") or ""
+                if role == "system":
+                    system_parts.append(self._normalize_for_prompt_cache(content))
+                elif role == "user":
+                    user = self._normalize_for_prompt_cache(content)
             if not user:
                 return ""
-            user = re.sub(r"\s+", " ", user)
-            return user[:500]
+            # Keep fingerprint small but context-aware: first + last system snippets.
+            sampled = []
+            if system_parts:
+                sampled.append(system_parts[0])
+                if len(system_parts) > 1:
+                    sampled.append(system_parts[-1])
+                if len(system_parts) > 2:
+                    sampled.append(system_parts[-2])
+            fingerprint_src = "||".join(sampled)
+            digest = hashlib.sha1(fingerprint_src.encode("utf-8")).hexdigest()[:16] if fingerprint_src else "nosys"
+            mode = getattr(self, "input_mode", "chat")
+            return f"{mode}|{digest}|{user[:420]}"
         except Exception:
             return ""
 
@@ -573,7 +973,7 @@ class WindowsAgent:
         out = t
         for pattern, replacement in fixes.items():
             out = re.sub(pattern, replacement, out, flags=re.IGNORECASE)
-        # Collapse horizontal whitespace only â preserve newlines so that
+        # Collapse horizontal whitespace only Ã¢Â€Â” preserve newlines so that
         # multi-line content pasted by the user (document body, code, etc.)
         # reaches _handle_word_command with its structure intact.
         out = re.sub(r'[^\S\n]+', ' ', out)        # spaces/tabs ? single space
@@ -593,7 +993,7 @@ class WindowsAgent:
             corrected = []
             for idx, tok in enumerate(tokens):
                 if idx >= 10:
-                    # Beyond command portion â keep everything as-is
+                    # Beyond command portion Ã¢Â€Â” keep everything as-is
                     corrected.extend(tokens[idx:])
                     break
                 lower = tok.lower()
@@ -647,7 +1047,7 @@ class WindowsAgent:
         if any(re.search(p, t, flags=re.IGNORECASE) for p in patterns):
             return True
         # Short follow-up questions (=4 words) during an active screen session
-        # e.g. "Powerpoint?", "which tab?", "and Chrome?" â treat as screen follow-ups
+        # e.g. "Powerpoint?", "which tab?", "and Chrome?" Ã¢Â€Â” treat as screen follow-ups
         words = t.split()
         if len(words) <= 4 and self.screen_sharing_active:
             return True
@@ -655,10 +1055,10 @@ class WindowsAgent:
 
     def _screen_task_prompt(self):
         base = (
-            "AUTONOMOUS TASK MODE â you are acting as the user's hands on screen.\n"
+            "AUTONOMOUS TASK MODE Ã¢Â€Â” you are acting as the user's hands on screen.\n"
             "The user wants you to perform actions on their behalf using the live screen context.\n"
             "1) Identify the active app/window and exact visible targets (buttons, fields, tabs, menus, links).\n"
-            "2) Break the task into precise numbered steps â each step = one action (click, type, hotkey, scroll, etc.).\n"
+            "2) Break the task into precise numbered steps Ã¢Â€Â” each step = one action (click, type, hotkey, scroll, etc.).\n"
             "3) Use exact labels from what you see on screen. Never invent labels.\n"
             "4) Include x/y coordinates or bounding boxes for each click target based on what you see.\n"
             "5) If a target is ambiguous or not visible, say so clearly and ask one short clarification.\n"
@@ -719,6 +1119,13 @@ class WindowsAgent:
 
     def _build_provider_order(self, messages):
         """Keep same capabilities, but route to stronger/faster provider based on request complexity."""
+        _base = (self.openai_compat_base_url or "").strip()
+        _local_compat = (
+            _base.startswith("http://localhost")
+            or _base.startswith("http://127.0.0.1")
+        )
+        has_openai_compatible = bool(_base and (self.openai_compat_api_key or _local_compat))
+        has_anthropic = bool((self.anthropic_api_key or "").strip())
         explicit_map = {
             "groq": "groq",
             "deepseek": "deepseek",
@@ -727,9 +1134,23 @@ class WindowsAgent:
             "dashscope": "qwen",
             "gemini": "gemini",
             "google": "gemini",
+            "anthropic": "anthropic",
+            "claude": "anthropic",
+            "glm": "glm",
+            "zhipu": "glm",
+            "mimo": "mimo",
+            "openai_compatible": "openai_compatible",
+            "openai-compatible": "openai_compatible",
+            "openai": "openai_compatible",
+            "ollama": "openai_compatible",
+            "openrouter": "openai_compatible",
         }
 
         available = []
+        if has_anthropic:
+            available.append("anthropic")
+        if has_openai_compatible:
+            available.append("openai_compatible")
         if self.gemini_api_key:
             available.append("gemini")
         if self.qwen_api_key:
@@ -738,6 +1159,10 @@ class WindowsAgent:
             available.append("deepseek")
         if self.groq_api_key:
             available.append("groq")
+        if self.glm_api_key:
+            available.append("glm")
+        if self.mimo_api_key:
+            available.append("mimo")
 
         if not available:
             return []
@@ -753,14 +1178,17 @@ class WindowsAgent:
             ordered.extend([p for p in available if p != chosen])
             return ordered
 
-        # SMART ROUTING: Always prefer strongest models for better understanding
-        # Gemini and Qwen are much smarter than Groq/DeepSeek for context
-        preferred = ["gemini", "qwen", "deepseek", "groq"]
+        # Base preference (quality-first), then adaptive re-ranking by learned reliability.
+        preferred = ["anthropic", "openai_compatible", "gemini", "qwen", "deepseek", "groq", "glm", "mimo"]
         ordered = [p for p in preferred if p in available]
         ordered.extend([p for p in available if p not in ordered])
-        
-        # Don't limit providers - let it try all for best results
-        return ordered
+        bias_map = {p: max(0.0, (len(ordered) - i) * 0.05) for i, p in enumerate(ordered)}
+        ranked = sorted(
+            ordered,
+            key=lambda p: self._provider_priority_score(p, position_bias=bias_map.get(p, 0.0)),
+            reverse=True,
+        )
+        return ranked
 
     def _retry_invoke(self, fn, retries):
         last_error = None
@@ -786,6 +1214,41 @@ class WindowsAgent:
     def get_ai_runtime_status(self):
         return dict(self.last_ai_runtime)
 
+    def _get_pdf_debug_logger(self):
+        import logging
+        lg = getattr(self, "_dbg_log", None)
+        if lg is not None:
+            return lg
+        lg = logging.getLogger("opuntia_pdf_debug")
+        lg.setLevel(logging.DEBUG)
+        lg.propagate = False
+        if not lg.handlers:
+            log_path = (os.getenv("OPUNTIA_DEBUG_LOG_PATH") or "").strip()
+            if not log_path:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                log_dir = os.path.join(base_dir, "logs")
+                try:
+                    os.makedirs(log_dir, exist_ok=True)
+                except Exception:
+                    pass
+                log_path = os.path.join(log_dir, "pdf_debug.log")
+            else:
+                log_path = os.path.expanduser(os.path.expandvars(log_path))
+                try:
+                    parent = os.path.dirname(log_path)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                except Exception:
+                    pass
+            try:
+                handler = logging.FileHandler(log_path, encoding="utf-8")
+            except Exception:
+                handler = logging.NullHandler()
+            handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+            lg.addHandler(handler)
+        self._dbg_log = lg
+        return lg
+
     def _is_affirmative(self, text):
         t = (text or "").strip().lower().strip("!.,?")
         return t in {
@@ -795,7 +1258,7 @@ class WindowsAgent:
             "go", "go ahead", "go on", "proceed", "do it", "let's do it", "let's go",
             "confirm", "confirmed", "allow", "allowed", "accept", "approved", "approve",
             "correct", "right", "true",
-            "oui", "si", "bien sÃ»r", "bien sur", "ouais", "???", "????", "????",
+            "oui", "si", "bien sÃƒÂ»r", "bien sur", "ouais", "???", "????", "????",
         }
 
     def _is_negative(self, text):
@@ -806,6 +1269,64 @@ class WindowsAgent:
             "deny", "denied", "reject", "rejected", "refuse",
             "non", "??", "??",
         }
+
+    def _is_reassurance_followup(self, text):
+        t = re.sub(r"\s+", " ", (text or "").strip().lower()).strip("!.,? ").strip()
+        if not t:
+            return False
+        if t in {"are you sure", "you sure", "sure", "really", "u sure"}:
+            return True
+        return bool(re.match(r"^(are\s+you\s+sure|you\s+sure|really)\??$", t))
+
+    def _handle_reassurance_followup(self):
+        if not self.conversation_history:
+            return None
+        last = self.conversation_history[-1] or {}
+        prev_user = (last.get("user") or "").strip()
+        prev_assistant = (last.get("assistant") or "").strip()
+        context = f"{prev_user}\n{prev_assistant}".lower()
+        if not re.search(r"\b(time|timezone|date\s+and\s+time|clock|france|paris|cest|cet)\b", context):
+            return None
+        france_line = ""
+        if re.search(r"\b(france|paris|cest|cet)\b", context):
+            try:
+                from zoneinfo import ZoneInfo
+                now_fr = datetime.now(ZoneInfo("Europe/Paris"))
+                france_line = (
+                    f" In France, it is {now_fr.strftime('%H:%M:%S')} {now_fr.tzname()} "
+                    f"on {now_fr.strftime('%A, %B %d, %Y')}."
+                )
+            except Exception:
+                pass
+        return (
+            "Yes. To match France on Windows, set your timezone to "
+            "`(UTC+01:00) Brussels, Copenhagen, Madrid, Paris` and keep "
+            "`Set time automatically` enabled."
+            + france_line
+        )
+
+    def _is_greeting_location_query(self, text):
+        t = (text or "").strip().lower()
+        if not t:
+            return False
+        has_greeting_ctx = bool(re.search(r"\b(greetings?|startup|welcome|header|ui)\b", t))
+        has_location_ctx = bool(re.search(r"\b(location|city|where|aubagne)\b", t))
+        has_opuntia_ctx = bool(re.search(r"\b(opuntia|you)\b", t))
+        wrong_city_ctx = bool(re.search(r"\b(not there|wrong|isn'?t right|im not there|i'?m not there)\b", t))
+        return (has_greeting_ctx and has_location_ctx and has_opuntia_ctx) or (("aubagne" in t) and has_greeting_ctx) or wrong_city_ctx
+
+    def _greeting_location_help_text(self):
+        current = (self.user_city or "").strip()
+        if current:
+            return (
+                f"The greeting location comes from your configured city: **{current}**.\n"
+                "If you want to change it, say: `my city is Paris` (or your city)."
+            )
+        return (
+            "You are right. That city in startup greeting came from automatic IP geolocation and can be wrong.\n"
+            "I fixed Opuntia to avoid showing a guessed city unless you set one.\n"
+            "If you want a fixed city in greeting, say: `my city is <your city>`."
+        )
 
     def _set_pending_confirmation(self, action, payload, prompt):
         self.pending_question = None
@@ -979,6 +1500,16 @@ class WindowsAgent:
         value = str((step_item or {}).get("value", "")).strip()
         x = (step_item or {}).get("x")
         y = (step_item or {}).get("y")
+        def _final(msg):
+            _msg = str(msg or "")
+            if re.search(r"\b(done|opened|waited|typed|scrolled)\b", _msg, re.IGNORECASE):
+                self._record_task_outcome(f"plan_{action or 'step'}", "success", reason=_msg, details={"target": target, "value": value})
+                return _msg
+            if re.search(r"\b(skipped)\b", _msg, re.IGNORECASE):
+                self._record_task_outcome(f"plan_{action or 'step'}", "pending", reason=_msg, details={"target": target, "value": value})
+                return _msg
+            self._record_task_outcome(f"plan_{action or 'step'}", "failed", reason=_msg, details={"target": target, "value": value})
+            return self._maybe_attach_failure_playbook(_msg, action_hint=f"plan_{action}", details={"target": target, "value": value})
 
         if action in {"click", "double_click", "right_click"}:
             if not self._plan_has_click_coordinates(step_item):
@@ -986,7 +1517,7 @@ class WindowsAgent:
                 if rx is not None and ry is not None:
                     x, y = rx, ry
             if not self._plan_has_click_coordinates(step_item):
-                return f"Skipped {action}: missing x/y coordinates for target '{target}'."
+                return _final(f"Skipped {action}: missing x/y coordinates for target '{target}'.")
             try:
                 if action == "click":
                     pyautogui.click(x=int(x), y=int(y))
@@ -994,28 +1525,28 @@ class WindowsAgent:
                     pyautogui.doubleClick(x=int(x), y=int(y))
                 else:
                     pyautogui.rightClick(x=int(x), y=int(y))
-                return f"Done: {action} at ({int(x)}, {int(y)})."
+                return _final(f"Done: {action} at ({int(x)}, {int(y)}).")
             except Exception as e:
-                return f"Failed {action}: {e}"
+                return _final(f"Failed {action}: {e}")
 
         if action == "type":
             if not value:
-                return "Skipped type: empty value."
+                return _final("Skipped type: empty value.")
             try:
                 pyautogui.write(value, interval=0.015)
-                return "Done: typed value."
+                return _final("Done: typed value.")
             except Exception as e:
-                return f"Failed type: {e}"
+                return _final(f"Failed type: {e}")
 
         if action == "hotkey":
             keys = [k.strip() for k in re.split(r"[+,]", value) if k.strip()]
             if not keys:
-                return "Skipped hotkey: no keys provided."
+                return _final("Skipped hotkey: no keys provided.")
             try:
                 pyautogui.hotkey(*keys)
-                return f"Done: hotkey {'+'.join(keys)}."
+                return _final(f"Done: hotkey {'+'.join(keys)}.")
             except Exception as e:
-                return f"Failed hotkey: {e}"
+                return _final(f"Failed hotkey: {e}")
 
         if action == "scroll":
             amount = 0
@@ -1024,24 +1555,24 @@ class WindowsAgent:
             except Exception:
                 amount = 0
             if amount == 0:
-                return "Skipped scroll: invalid value."
+                return _final("Skipped scroll: invalid value.")
             try:
                 pyautogui.scroll(amount)
-                return f"Done: scrolled {amount}."
+                return _final(f"Done: scrolled {amount}.")
             except Exception as e:
-                return f"Failed scroll: {e}"
+                return _final(f"Failed scroll: {e}")
 
         if action == "open_url":
             url = value or target
             if not url:
-                return "Skipped open_url: empty URL."
+                return _final("Skipped open_url: empty URL.")
             if not re.match(r"^https?://", url, flags=re.IGNORECASE):
                 url = "https://" + url
             try:
                 webbrowser.open(url)
-                return f"Done: opened {url}."
+                return _final(f"Done: opened {url}.")
             except Exception as e:
-                return f"Failed open_url: {e}"
+                return _final(f"Failed open_url: {e}")
 
         if action == "wait":
             sec = 1.0
@@ -1050,15 +1581,26 @@ class WindowsAgent:
             except Exception:
                 sec = 1.0
             time.sleep(sec)
-            return f"Done: waited {sec:.1f}s."
+            return _final(f"Done: waited {sec:.1f}s.")
 
-        return f"Skipped unsupported action '{action}'."
+        return _final(f"Skipped unsupported action '{action}'.")
 
     def _start_plan_execution(self):
         plan = self.last_screen_action_plan or {}
         actions = plan.get("actions") if isinstance(plan, dict) else None
         if not isinstance(actions, list) or not actions:
             return "No executable screen action plan available yet."
+        pol = self._autonomy_policy()
+        if pol.get("auto_execute_plan_steps", False):
+            logs = []
+            for idx, step in enumerate(actions[:40], start=1):
+                result = self._execute_plan_action(step)
+                logs.append(f"{idx}. {result}")
+                if re.search(r"\b(failed|error|could not|unable|blocked|denied)\b", str(result), re.IGNORECASE):
+                    self._audit("screen_plan", "paused", {"step_index": idx, "reason": str(result)[:180]})
+                    return "Screen plan auto-execution paused on failure:\n" + "\n".join(logs[-8:])
+            self.pending_plan_execution = None
+            return "Screen plan auto-execution completed.\n" + "\n".join(logs[-10:])
         self.pending_plan_execution = {"index": 0, "actions": actions}
         first = actions[0]
         prompt = self._format_plan_step_prompt(first, 1, len(actions))
@@ -1088,28 +1630,202 @@ class WindowsAgent:
         }
         return self._format_plan_step_prompt(next_step, next_index + 1, len(actions))
 
+    def _parse_workflow_plan_steps(self, raw_text):
+        text = (raw_text or "").strip()
+        if not text:
+            return []
+        # Try JSON first.
+        try:
+            m = re.search(r"```json\s*(\[[\s\S]*?\])\s*```", text, flags=re.IGNORECASE)
+            arr = json.loads(m.group(1).strip()) if m else json.loads(text)
+            if isinstance(arr, list):
+                out = []
+                for row in arr:
+                    if isinstance(row, dict):
+                        cmd = (row.get("command") or row.get("step") or "").strip()
+                    else:
+                        cmd = str(row).strip()
+                    if cmd:
+                        out.append(cmd[:240])
+                return out[:24]
+        except Exception:
+            pass
+        # Fallback: numbered lines.
+        out = []
+        for line in text.splitlines():
+            line = re.sub(r"^\s*(?:\d+[\).\-\s]+|[-*]\s+)", "", line).strip()
+            if line:
+                out.append(line[:240])
+        return out[:24]
+
+    def _build_workflow_plan(self, goal_text):
+        goal = (goal_text or "").strip()
+        if not goal:
+            return {"goal": "", "steps": []}
+        prompt = (
+            "Create a concise executable Windows task workflow.\n"
+            "Output ONLY a JSON array of short command strings that Opuntia can execute.\n"
+            "Rules: one action per step, imperative form, no explanations, max 12 steps."
+        )
+        steps = []
+        try:
+            plan_raw = self._call_ai(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": goal[:1200]},
+                ]
+            )
+            steps = self._parse_workflow_plan_steps(plan_raw)
+        except Exception:
+            steps = []
+        if not steps:
+            steps = [goal[:240]]
+        plan = {
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+            "goal": goal[:500],
+            "steps": steps[:24],
+            "cursor": 0,
+        }
+        self.pending_workflow_plan = plan
+        self._audit("workflow_plan", "created", {"goal": goal[:180], "steps": len(plan["steps"])})
+        return plan
+
+    def _verify_workflow_step(self, step_cmd, response_text):
+        msg = str(response_text or "")
+        if re.search(r"\b(done|opened|saved|created|completed|running|success)\b", msg, re.IGNORECASE):
+            return True
+        if re.search(r"\b(failed|error|could not|unable|blocked|denied|timed out)\b", msg, re.IGNORECASE):
+            return False
+        # Neutral conversational outputs are treated as pass in workflow mode.
+        return True
+
+    def _attempt_recovery_chain(self, action_hint, step_cmd, failure_text):
+        hint = (action_hint or "").strip().lower()
+        cmd = (step_cmd or "").strip()
+        fail = (failure_text or "").strip()
+        attempts = []
+        if hint in {"open_app", "open"}:
+            target = re.sub(r"^\s*(open|launch)\s+", "", cmd, flags=re.IGNORECASE).strip()
+            if target:
+                suggestion = self._suggest_open_target(target)
+                if suggestion and suggestion.lower() != target.lower():
+                    attempts.append(f"open {suggestion}")
+        if hint in {"open_url", "navigate", "search"}:
+            if re.search(r"\bhttps?://", cmd, re.IGNORECASE):
+                attempts.append(re.sub(r"\bopen\b", "search", cmd, flags=re.IGNORECASE))
+        if hint in {"close_app", "close"}:
+            target = re.sub(r"^\s*(close|quit)\s+", "", cmd, flags=re.IGNORECASE).strip()
+            if target:
+                attempts.append(f"check {target} running")
+        # Generic fallback: ask status first, then retry exactly once.
+        if not attempts:
+            attempts.append(cmd)
+        max_attempts = max(1, int(self._autonomy_policy().get("max_recovery_attempts", 1)))
+        attempts = attempts[:max_attempts]
+        for candidate in attempts:
+            try:
+                out = self.process_command(f"MODE_TASK::{candidate}")
+            except Exception as e:
+                out = f"Recovery failed: {e}"
+            if out and not re.search(r"\b(failed|error|could not|unable|blocked|denied|timed out)\b", str(out), re.IGNORECASE):
+                self._record_task_outcome("workflow_recovery", "success", reason=str(out), details={"candidate": candidate, "from": cmd})
+                return f"Recovered via: `{candidate}`\n{out}"
+        self._record_task_outcome("workflow_recovery", "failed", reason=fail or cmd, details={"from": cmd})
+        return ""
+
+    def _execute_workflow_plan(self, max_steps=24):
+        plan = self.pending_workflow_plan if isinstance(self.pending_workflow_plan, dict) else None
+        if not plan:
+            return "No pending workflow plan. Use: plan workflow <goal>"
+        steps = list(plan.get("steps") or [])
+        if not steps:
+            return "Workflow plan is empty."
+        cursor = int(plan.get("cursor", 0))
+        limit = min(len(steps), cursor + max(1, int(max_steps)))
+        logs = []
+        for idx in range(cursor, limit):
+            step = (steps[idx] or "").strip()
+            if not step:
+                continue
+            response = self.process_command(f"MODE_TASK::{step}")
+            verified = self._verify_workflow_step(step, response)
+            logs.append(f"{idx+1}. {step}\n{response}")
+            if not verified:
+                action_hint = "open_app" if re.match(r"^\s*(open|launch)\b", step, re.IGNORECASE) else \
+                              "close_app" if re.match(r"^\s*(close|quit)\b", step, re.IGNORECASE) else \
+                              "open_url" if re.search(r"\bhttps?://|navigate|visit\b", step, re.IGNORECASE) else "task"
+                recovered = self._attempt_recovery_chain(action_hint, step, str(response))
+                if recovered:
+                    logs.append(f"Recovery:\n{recovered}")
+                else:
+                    plan["cursor"] = idx
+                    self.pending_workflow_plan = plan
+                    self._audit("workflow_plan", "paused", {"cursor": idx, "step": step[:140]})
+                    return (
+                        "Workflow paused at a failed step.\n\n"
+                        + "\n\n".join(logs[-6:])
+                        + "\n\nUse `run workflow` to retry after adjustment."
+                    )
+        plan["cursor"] = limit
+        done = (limit >= len(steps))
+        self.pending_workflow_plan = None if done else plan
+        self._audit("workflow_plan", "completed" if done else "partial", {"cursor": limit, "total": len(steps)})
+        return ("Workflow completed.\n\n" if done else "Workflow partially executed.\n\n") + "\n\n".join(logs[-8:])
+
     def _run_confirmed_action(self, action, payload):
+        def _finish(text, action_name, details=None):
+            msg = str(text or "")
+            if re.search(r"\b(done|opened|saved|created|completed|running)\b", msg, re.IGNORECASE):
+                self._record_task_outcome(action_name, "success", reason=msg, details=details if isinstance(details, dict) else {})
+                return msg
+            if re.search(r"\b(cancelled|authorization required|permission required)\b", msg, re.IGNORECASE):
+                self._record_task_outcome(action_name, "pending", reason=msg, details=details if isinstance(details, dict) else {})
+                return msg
+            if re.search(r"\b(could not|failed|error|blocked|denied|unsupported|nothing was created)\b", msg, re.IGNORECASE):
+                self._record_task_outcome(action_name, "failed", reason=msg, details=details if isinstance(details, dict) else {})
+                return self._maybe_attach_failure_playbook(msg, action_hint=action_name, details=details if isinstance(details, dict) else {})
+            return msg
         if action == "open_app":
             target = (payload or {}).get("target", "")
             if not target:
                 return "Cancelled."
             opened = self.open_app(target)
-            return opened or f"Could not open {target}"
+            return _finish(opened or f"Could not open {target}", "open_app", {"target": target})
         if action == "close_app":
             target = (payload or {}).get("target", "")
             if not target:
                 return "Cancelled."
             result = self.close_app(target)
-            return result or f"Could not close {target}"
+            return _finish(result or f"Could not close {target}", "close_app", {"target": target})
         if action == "file_mutation":
+            cmd = (payload or {}).get("command", "")
+            allow_desktop = bool((payload or {}).get("allow_desktop", False))
+            allow_outside_mcp = bool((payload or {}).get("allow_outside_mcp", False))
+            if not cmd:
+                return "Cancelled."
+            out = self._handle_file_command(
+                cmd,
+                allow_desktop=allow_desktop,
+                allow_mutation=True,
+                allow_outside_mcp=allow_outside_mcp,
+            )
+            if out is None:
+                return _finish("Could not execute file command.", "file_mutation", {"command": cmd[:240]})
+            return _finish(out, "file_mutation", {"command": cmd[:240]})
+        if action == "file_mutation_outside_allowed":
             cmd = (payload or {}).get("command", "")
             allow_desktop = bool((payload or {}).get("allow_desktop", False))
             if not cmd:
                 return "Cancelled."
-            out = self._handle_file_command(cmd, allow_desktop=allow_desktop, allow_mutation=True)
+            out = self._handle_file_command(
+                cmd,
+                allow_desktop=allow_desktop,
+                allow_mutation=True,
+                allow_outside_mcp=True,
+            )
             if out is None:
-                return "Could not execute file command."
-            return out
+                return _finish("Could not execute file command.", "file_mutation", {"command": cmd[:240]})
+            return _finish(out, "file_mutation", {"command": cmd[:240], "outside_mcp": True})
         if action == "file_tree_creation":
             operations = (payload or {}).get("operations") or []
             allow_desktop = bool((payload or {}).get("allow_desktop", False))
@@ -1117,50 +1833,62 @@ class WindowsAgent:
                 return "Cancelled."
             results = self._execute_file_tree(operations, allow_desktop=allow_desktop)
             if not results:
-                return "Nothing was created."
-            return "Done! Created:\n" + "\n".join(f"  {r}" for r in results)
+                return _finish("Nothing was created.", "file_tree_creation", {"count": 0})
+            return _finish("Done! Created:\n" + "\n".join(f"  {r}" for r in results), "file_tree_creation", {"count": len(results)})
         if action == "create_word_doc":
             filepath  = (payload or {}).get("filepath", "")
             content   = (payload or {}).get("content", "")
             doc_title = (payload or {}).get("doc_title", "")
             if not filepath:
                 return "Cancelled."
-            return self._execute_word_creation(filepath, content, doc_title)
+            return _finish(self._execute_word_creation(filepath, content, doc_title), "create_word_doc", {"filepath": filepath})
         if action == "create_word_doc_confirm":
             orig_input = (payload or {}).get("user_input", "")
             allow_desktop = bool((payload or {}).get("allow_desktop", True))
             if not orig_input:
                 return "Cancelled."
-            return self._handle_word_command(orig_input, allow_desktop=allow_desktop, allow_mutation=True)
+            return _finish(
+                self._handle_word_command(orig_input, allow_desktop=allow_desktop, allow_mutation=True),
+                "create_word_doc_confirm",
+                {"input": orig_input[:240]},
+            )
         if action == "create_pdf_confirm":
             orig_input = (payload or {}).get("user_input", "")
             allow_desktop = bool((payload or {}).get("allow_desktop", True))
             if not orig_input:
                 return "Cancelled."
-            return self._handle_pdf_command(orig_input, allow_desktop=allow_desktop, allow_mutation=True)
+            return _finish(
+                self._handle_pdf_command(orig_input, allow_desktop=allow_desktop, allow_mutation=True),
+                "create_pdf_confirm",
+                {"input": orig_input[:240]},
+            )
         if action == "create_word_doc_clarify":
-            # User confirmed clarifying question — route through permission gate
+            # User confirmed clarifying question â€” route through permission gate
             orig_input = (payload or {}).get("user_input", "")
             if not orig_input:
                 return "Cancelled."
-            return self._handle_word_command(orig_input, allow_desktop=True, allow_mutation=False)
+            return _finish(
+                self._handle_word_command(orig_input, allow_desktop=True, allow_mutation=False),
+                "create_word_doc_clarify",
+                {"input": orig_input[:240]},
+            )
         if action == "search_on_app":
             query = (payload or {}).get("query", "")
             app = (payload or {}).get("app", "")
             if not query:
                 return "Cancelled."
-            return self.search_web_on_app(query, app or None)
+            return _finish(self.search_web_on_app(query, app or None), "search_on_app", {"query": query[:180], "app": app})
         if action == "windows_power":
             power_action = (payload or {}).get("action", "")
             if not power_action:
                 return "Cancelled."
-            return self._execute_windows_power_action(power_action)
+            return _finish(self._execute_windows_power_action(power_action), "windows_power", {"action": power_action})
         if action == "execute_plan_step":
             step_item = (payload or {}).get("step_item") or {}
             step_index = int((payload or {}).get("step_index", 0))
             result = self._execute_plan_action(step_item)
             tail = self._run_next_plan_step_after(step_index)
-            return result + "\n" + tail
+            return _finish(result + "\n" + tail, "execute_plan_step", {"step_index": step_index})
         return "Cancelled."
 
     def _promote_history_to_training(self):
@@ -1192,16 +1920,29 @@ class WindowsAgent:
     def start_new_session(self):
         """Called on new chat or app restart: forget conversation context, keep training data."""
         if self.memory_enabled:
+            chat_recap = self._generate_session_recap_from_history(self.conversation_history, mode="chat")
+            task_recap = self._generate_session_recap_from_history(self.task_conversation_history, mode="task")
+            if chat_recap:
+                self._append_session_recap("chat", chat_recap)
+            if task_recap:
+                self._append_session_recap("task", task_recap)
+        if self.memory_enabled:
             self._promote_history_to_training()
             if self.learned_facts:
                 self._save_learned_facts()
+            self._save_task_outcomes()
+            self._save_trajectory_memory()
+            self._save_provider_stats()
+            self._save_mcp_route_stats()
         self.conversation_history = []
+        self.task_conversation_history = []
         self.last_live_web_query = ""
         self.last_live_web_error = ""
         self.last_structured_intent = ""
         self.last_structured_payload = {}
         self.last_screen_action_plan = None
         self.pending_plan_execution = None
+        self.pending_workflow_plan = None
         self.pending_confirmation = None
         self.pending_question = None
         if self.user_profile:
@@ -1224,6 +1965,10 @@ class WindowsAgent:
                         self._pre_private_memory_enabled = data.get("memory_enabled_before_private")
                     if "feedback_enabled_before_private" in data:
                         self._pre_private_feedback_enabled = data.get("feedback_enabled_before_private")
+                    if "autonomy_profile" in data:
+                        self.autonomy_profile = str(data.get("autonomy_profile") or self.autonomy_profile).strip().lower()
+                    if "user_city" in data:
+                        self.user_city = str(data.get("user_city") or "").strip()
             if self.private_mode:
                 self.memory_enabled = False
                 self.feedback_enabled = False
@@ -1241,12 +1986,454 @@ class WindowsAgent:
                         "private_mode": bool(self.private_mode),
                         "memory_enabled_before_private": self._pre_private_memory_enabled,
                         "feedback_enabled_before_private": self._pre_private_feedback_enabled,
+                        "autonomy_profile": self.autonomy_profile,
+                        "user_city": self.user_city,
                     },
                     f,
                     indent=2,
                 )
         except Exception:
             pass
+
+    def _load_provider_stats(self):
+        self.provider_health = {}
+        self.provider_cooldown_until = {}
+        self.provider_last_error = {}
+        try:
+            if not os.path.exists(self.provider_stats_file):
+                return
+            with open(self.provider_stats_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            ph = data.get("provider_health") or {}
+            if isinstance(ph, dict):
+                for provider, row in ph.items():
+                    if not isinstance(row, dict):
+                        continue
+                    self.provider_health[str(provider)] = {
+                        "ok": int(row.get("ok", 0) or 0),
+                        "fail": int(row.get("fail", 0) or 0),
+                        "avg_latency_ms": float(row.get("avg_latency_ms", 0.0) or 0.0),
+                        "last_ok_ts": float(row.get("last_ok_ts", 0.0) or 0.0),
+                        "last_fail_ts": float(row.get("last_fail_ts", 0.0) or 0.0),
+                    }
+            cd = data.get("provider_cooldown_until") or {}
+            if isinstance(cd, dict):
+                self.provider_cooldown_until = {str(k): float(v or 0.0) for k, v in cd.items()}
+            le = data.get("provider_last_error") or {}
+            if isinstance(le, dict):
+                self.provider_last_error = {str(k): str(v or "")[:220] for k, v in le.items()}
+        except Exception:
+            self.provider_health = {}
+            self.provider_cooldown_until = {}
+            self.provider_last_error = {}
+
+    def _save_provider_stats(self):
+        try:
+            os.makedirs(os.path.dirname(self.provider_stats_file), exist_ok=True)
+            payload = {
+                "provider_health": self.provider_health,
+                "provider_cooldown_until": self.provider_cooldown_until,
+                "provider_last_error": self.provider_last_error,
+            }
+            with open(self.provider_stats_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _record_provider_result(self, provider, ok, latency_ms=0.0, error_text=""):
+        p = (provider or "").strip().lower()
+        if not p:
+            return
+        row = self.provider_health.get(
+            p,
+            {"ok": 0, "fail": 0, "avg_latency_ms": 0.0, "last_ok_ts": 0.0, "last_fail_ts": 0.0},
+        )
+        now = time.time()
+        if ok:
+            row["ok"] = int(row.get("ok", 0)) + 1
+            prev = float(row.get("avg_latency_ms", 0.0) or 0.0)
+            if prev <= 0:
+                row["avg_latency_ms"] = float(latency_ms or 0.0)
+            else:
+                row["avg_latency_ms"] = (prev * 0.82) + (float(latency_ms or 0.0) * 0.18)
+            row["last_ok_ts"] = now
+            self.provider_cooldown_until[p] = 0.0
+            self.provider_last_error[p] = ""
+        else:
+            row["fail"] = int(row.get("fail", 0)) + 1
+            row["last_fail_ts"] = now
+            self.provider_last_error[p] = str(error_text or "")[:220]
+            # Exponential-ish short cooldown after repeated failures.
+            fail_n = max(1, int(row.get("fail", 1)))
+            cooldown_sec = min(180.0, 5.0 * (1.4 ** min(8, fail_n)))
+            self.provider_cooldown_until[p] = now + cooldown_sec
+        self.provider_health[p] = row
+        if ((row.get("ok", 0) + row.get("fail", 0)) % 4) == 0:
+            self._save_provider_stats()
+
+    def _provider_priority_score(self, provider, position_bias=0.0):
+        p = (provider or "").strip().lower()
+        now = time.time()
+        cooldown = float(self.provider_cooldown_until.get(p, 0.0) or 0.0)
+        if cooldown > now:
+            return -9999.0
+        row = self.provider_health.get(p, {})
+        ok_n = float(row.get("ok", 0) or 0.0)
+        fail_n = float(row.get("fail", 0) or 0.0)
+        total = ok_n + fail_n
+        success_ratio = (ok_n / total) if total > 0 else 0.6
+        latency = float(row.get("avg_latency_ms", 0.0) or 0.0)
+        latency_penalty = min(0.8, latency / 9000.0) if latency > 0 else 0.0
+        recency_bonus = 0.0
+        last_ok = float(row.get("last_ok_ts", 0.0) or 0.0)
+        if last_ok > 0:
+            age = max(0.0, now - last_ok)
+            recency_bonus = max(0.0, 0.22 - min(0.22, age / 3600.0))
+        fail_pressure = min(0.6, fail_n / max(1.0, total + 1.0))
+        score = (success_ratio * 1.8) - latency_penalty - fail_pressure + recency_bonus + float(position_bias)
+        return score
+
+    def _provider_stats_text(self):
+        providers = sorted(set(list(self.provider_health.keys()) + list(self.provider_cooldown_until.keys())))
+        if not providers:
+            return "Provider stats: no data yet."
+        now = time.time()
+        lines = ["Provider stats:"]
+        for p in providers:
+            row = self.provider_health.get(p, {})
+            ok_n = int(row.get("ok", 0) or 0)
+            fail_n = int(row.get("fail", 0) or 0)
+            lat = float(row.get("avg_latency_ms", 0.0) or 0.0)
+            cd_until = float(self.provider_cooldown_until.get(p, 0.0) or 0.0)
+            cd_left = max(0.0, cd_until - now)
+            err = (self.provider_last_error.get(p) or "").strip()
+            line = f"- {p}: ok={ok_n}, fail={fail_n}, avg_latency={lat:.0f}ms, cooldown={cd_left:.0f}s"
+            if err:
+                line += f", last_error={err[:90]}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def _configured_models_text(self):
+        rows = [
+            ("anthropic", self.anthropic_model, bool((self.anthropic_api_key or "").strip())),
+            ("openai_compatible", self.openai_compat_model, bool((self.openai_compat_base_url or "").strip())),
+            ("gemini", self.gemini_model, bool((self.gemini_api_key or "").strip())),
+            ("qwen", self.qwen_model, bool((self.qwen_api_key or "").strip())),
+            ("deepseek", self.deepseek_model, bool((self.deepseek_api_key or "").strip())),
+            ("groq", self.groq_model, bool((self.groq_api_key or "").strip())),
+        ]
+        lines = []
+        for provider, model, enabled in rows:
+            lines.append(f"- {provider}: model={model}, enabled={'yes' if enabled else 'no'}")
+        return "\n".join(lines)
+
+    def _ai_model_status_text(self):
+        runtime = self.get_ai_runtime_status()
+        pref = (self.ai_provider or "auto").strip().lower()
+        strict = bool(self.ai_provider_strict)
+        return (
+            "AI model status:\n"
+            f"  - preferred_provider: {pref}\n"
+            f"  - strict_provider: {strict}\n"
+            f"  - last_runtime_provider: {runtime.get('provider', 'unknown')}\n"
+            f"  - last_runtime_model: {runtime.get('model', 'unknown')}\n"
+            f"  - last_runtime_status: {runtime.get('status', 'unknown')}\n"
+            "Configured models:\n"
+            f"{self._configured_models_text()}"
+        )
+
+    def _reset_provider_stats(self):
+        self.provider_health = {}
+        self.provider_cooldown_until = {}
+        self.provider_last_error = {}
+        self._save_provider_stats()
+
+    def _load_mcp_route_stats(self):
+        self.mcp_route_stats = {}
+        try:
+            if not os.path.exists(self.mcp_route_stats_file):
+                return
+            with open(self.mcp_route_stats_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            rs = data.get("routes") if isinstance(data.get("routes"), dict) else data
+            if not isinstance(rs, dict):
+                return
+            cleaned = {}
+            for action, row in rs.items():
+                if not isinstance(row, dict):
+                    continue
+                cleaned[str(action)] = {
+                    "mcp_ok": int(row.get("mcp_ok", 0) or 0),
+                    "mcp_fail": int(row.get("mcp_fail", 0) or 0),
+                    "local_ok": int(row.get("local_ok", 0) or 0),
+                    "local_fail": int(row.get("local_fail", 0) or 0),
+                    "last_error": str(row.get("last_error", "") or "")[:220],
+                }
+            self.mcp_route_stats = cleaned
+        except Exception:
+            self.mcp_route_stats = {}
+
+    def _save_mcp_route_stats(self):
+        try:
+            os.makedirs(os.path.dirname(self.mcp_route_stats_file), exist_ok=True)
+            with open(self.mcp_route_stats_file, "w", encoding="utf-8") as f:
+                json.dump({"routes": self.mcp_route_stats}, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _record_file_route_result(self, action_key, route, ok, error_text=""):
+        k = str(action_key or "file_op").strip().lower()
+        rt = "mcp" if str(route or "").strip().lower() == "mcp" else "local"
+        row = self.mcp_route_stats.get(
+            k,
+            {"mcp_ok": 0, "mcp_fail": 0, "local_ok": 0, "local_fail": 0, "last_error": ""},
+        )
+        field = f"{rt}_{'ok' if ok else 'fail'}"
+        row[field] = int(row.get(field, 0) or 0) + 1
+        if not ok and error_text:
+            row["last_error"] = str(error_text)[:220]
+        self.mcp_route_stats[k] = row
+        total = int(row.get("mcp_ok", 0) + row.get("mcp_fail", 0) + row.get("local_ok", 0) + row.get("local_fail", 0))
+        if total % 4 == 0:
+            self._save_mcp_route_stats()
+
+    def _prefer_mcp_for_action(self, action_key):
+        if not self.mcp_enabled or self.mcp_bridge is None:
+            return False
+        k = str(action_key or "").strip().lower()
+        row = self.mcp_route_stats.get(k, {})
+        m_ok = float(row.get("mcp_ok", 0) or 0.0)
+        m_fail = float(row.get("mcp_fail", 0) or 0.0)
+        l_ok = float(row.get("local_ok", 0) or 0.0)
+        l_fail = float(row.get("local_fail", 0) or 0.0)
+        # Default bias: MCP-first for read/list/search/move operations.
+        if (m_ok + m_fail + l_ok + l_fail) < 2:
+            return k in {"list_files", "read_file", "search_files", "create_folder", "write_file", "move_file"}
+        m_score = (m_ok + 1.0) / (m_ok + m_fail + 2.0)
+        l_score = (l_ok + 1.0) / (l_ok + l_fail + 2.0)
+        return m_score >= (l_score - 0.03)
+
+    def _mcp_routing_status_text(self):
+        if not self.mcp_route_stats:
+            return "MCP routing: no history yet."
+        lines = ["MCP routing stats:"]
+        for action in sorted(self.mcp_route_stats.keys()):
+            row = self.mcp_route_stats.get(action, {})
+            lines.append(
+                f"- {action}: mcp(ok={int(row.get('mcp_ok',0))}, fail={int(row.get('mcp_fail',0))}) "
+                f"local(ok={int(row.get('local_ok',0))}, fail={int(row.get('local_fail',0))}) "
+                f"prefer={'mcp' if self._prefer_mcp_for_action(action) else 'local'}"
+            )
+        return "\n".join(lines)
+
+    def _mcp_server_name(self):
+        if self.mcp_bridge is None:
+            return ""
+        names = self.mcp_bridge.list_servers() if hasattr(self.mcp_bridge, "list_servers") else []
+        pref = (self.mcp_default_server or "").strip().lower()
+        if pref and pref in names:
+            return pref
+        if names:
+            return names[0]
+        return ""
+
+    def _mcp_allowed_directories(self, force=False):
+        now = time.time()
+        if (not force) and self._mcp_allowed_dirs_cache and (now - float(self._mcp_allowed_dirs_ts or 0.0) <= max(10, self.mcp_allowed_dirs_ttl_sec)):
+            return list(self._mcp_allowed_dirs_cache)
+        server = self._mcp_server_name()
+        if not server or self.mcp_bridge is None:
+            return []
+        ok, out = self.mcp_bridge.call_tool(server, "list_allowed_directories", {})
+        if not ok:
+            return []
+        payload = ""
+        if isinstance(out, dict):
+            payload = str(out.get("output") or "")
+        else:
+            payload = str(out or "")
+        dirs = []
+        try:
+            # Try JSON parse first
+            parsed = json.loads(payload)
+            if isinstance(parsed, dict):
+                arr = parsed.get("allowedDirectories") or parsed.get("allowed_directories") or parsed.get("directories") or []
+            elif isinstance(parsed, list):
+                arr = parsed
+            else:
+                arr = []
+            for p in arr:
+                if isinstance(p, str) and p.strip():
+                    dirs.append(os.path.realpath(os.path.abspath(p.strip())))
+        except Exception:
+            for m in re.findall(r"[A-Za-z]:\\\\[^\"'\n\r,\]]+", payload):
+                dirs.append(os.path.realpath(os.path.abspath(m.strip())))
+        dirs = sorted(set([d for d in dirs if d and os.path.isabs(d)]))
+        self._mcp_allowed_dirs_cache = dirs
+        self._mcp_allowed_dirs_ts = now
+        return dirs
+
+    def _path_within_roots(self, path_value, roots):
+        try:
+            p = os.path.normcase(os.path.realpath(os.path.abspath(str(path_value or "").strip())))
+        except Exception:
+            return False
+        for r in roots or []:
+            try:
+                rc = os.path.normcase(os.path.realpath(os.path.abspath(str(r or "").strip())))
+            except Exception:
+                continue
+            if p == rc or p.startswith(rc + os.sep):
+                return True
+        return False
+
+    def _mcp_write_allowed(self, path_value):
+        roots = self._mcp_allowed_directories(force=False)
+        if not roots:
+            return True
+        return self._path_within_roots(path_value, roots)
+
+    def _mcp_call_filesystem_tool(self, tool_name, arguments, action_key="file_op"):
+        if not self.mcp_enabled or self.mcp_bridge is None:
+            return False, "MCP unavailable."
+        server = self._mcp_server_name()
+        if not server:
+            self._record_file_route_result(action_key, "mcp", False, error_text="no server configured")
+            return False, "No MCP server configured."
+        ok, out = self.mcp_bridge.call_tool(server, tool_name, arguments if isinstance(arguments, dict) else {})
+        if not ok:
+            self._record_file_route_result(action_key, "mcp", False, error_text=str(out))
+            return False, str(out)
+        msg = str((out or {}).get("output") if isinstance(out, dict) else out or "").strip()
+        self._record_file_route_result(action_key, "mcp", True)
+        return True, msg
+
+    def _mcp_status_text(self):
+        if not self.mcp_enabled:
+            return "MCP is disabled (`MCP_ENABLED=0`)."
+        if self.mcp_bridge is None:
+            return "MCP bridge unavailable. Install dependency with: pip install mcp"
+        st = self.mcp_bridge.status_dict() if hasattr(self.mcp_bridge, "status_dict") else {}
+        server = self._mcp_server_name()
+        return (
+            "MCP status:\n"
+            f"  - sdk_available: {bool(st.get('sdk_available', False))}\n"
+            f"  - http_available: {bool(st.get('http_available', False))}\n"
+            f"  - servers_count: {int(st.get('servers_count', 0))}\n"
+            f"  - default_server: {server or 'none'}\n"
+            f"  - config_path: {st.get('config_path', self.mcp_config_path)}\n"
+            f"  - route_stats: {len(self.mcp_route_stats)} actions tracked\n"
+            f"  - load_error: {st.get('load_error', '') or 'none'}"
+        )
+
+    def _mcp_servers_text(self):
+        if not self.mcp_enabled:
+            return "MCP is disabled."
+        if self.mcp_bridge is None:
+            return "MCP bridge unavailable. Install dependency with: pip install mcp"
+        names = self.mcp_bridge.list_servers() if hasattr(self.mcp_bridge, "list_servers") else []
+        if not names:
+            return (
+                "No MCP servers configured.\n"
+                f"Create `{self.mcp_config_path}` with a `servers` object (or top-level map)."
+            )
+        lines = ["Configured MCP servers:"]
+        for n in names:
+            lines.append(f"- {n}")
+        return "\n".join(lines)
+
+    def _mcp_tools_text(self, server_name):
+        if not self.mcp_enabled:
+            return "MCP is disabled."
+        if self.mcp_bridge is None:
+            return "MCP bridge unavailable. Install dependency with: pip install mcp"
+        ok, out = self.mcp_bridge.list_tools(server_name)
+        if not ok:
+            return str(out)
+        tools = out if isinstance(out, list) else []
+        if not tools:
+            return f"MCP server `{server_name}` has no tools."
+        lines = [f"MCP tools on `{server_name}` ({len(tools)}):"]
+        for t in tools[:80]:
+            name = str((t or {}).get("name") or "").strip()
+            desc = str((t or {}).get("description") or "").strip()
+            if not name:
+                continue
+            if desc:
+                lines.append(f"- {name}: {desc[:140]}")
+            else:
+                lines.append(f"- {name}")
+        return "\n".join(lines)
+
+    def _mcp_call_text(self, server_name, tool_name, args_obj):
+        if not self.mcp_enabled:
+            return "MCP is disabled."
+        if self.mcp_bridge is None:
+            return "MCP bridge unavailable. Install dependency with: pip install mcp"
+        ok, out = self.mcp_bridge.call_tool(server_name, tool_name, args_obj if isinstance(args_obj, dict) else {})
+        if not ok:
+            return str(out)
+        if isinstance(out, dict):
+            payload = str(out.get("output") or "").strip()
+            lat = int(out.get("latency_ms", 0) or 0)
+            if payload:
+                return f"MCP `{server_name}.{tool_name}` ({lat} ms):\n{payload}"
+            return f"MCP `{server_name}.{tool_name}` finished ({lat} ms)."
+        return str(out)
+
+    def _autonomy_policy(self):
+        mode = (self.autonomy_profile or "balanced").strip().lower()
+        if mode not in {"safe", "balanced", "autonomous"}:
+            mode = "balanced"
+            self.autonomy_profile = "balanced"
+        if mode == "safe":
+            return {
+                "mode": "safe",
+                "require_sensitive_confirmation": True,
+                "auto_execute_plan_steps": False,
+                "max_recovery_attempts": 1,
+                "verify_steps": True,
+            }
+        if mode == "autonomous":
+            return {
+                "mode": "autonomous",
+                "require_sensitive_confirmation": False,
+                "auto_execute_plan_steps": True,
+                "max_recovery_attempts": 3,
+                "verify_steps": True,
+            }
+        return {
+            "mode": "balanced",
+            "require_sensitive_confirmation": True,
+            "auto_execute_plan_steps": False,
+            "max_recovery_attempts": 2,
+            "verify_steps": True,
+        }
+
+    def set_autonomy_profile(self, profile, persist=True):
+        p = (profile or "").strip().lower()
+        if p not in {"safe", "balanced", "autonomous"}:
+            return False, "Unknown autonomy profile. Use: safe, balanced, autonomous."
+        self.autonomy_profile = p
+        if persist:
+            self._save_settings()
+        self._audit("autonomy_profile", "set", {"mode": p})
+        return True, f"Autonomy profile set to {p}."
+
+    def _autonomy_status_text(self):
+        pol = self._autonomy_policy()
+        return (
+            "Autonomy profile:\n"
+            f"  - mode: {pol['mode']}\n"
+            f"  - require_sensitive_confirmation: {pol['require_sensitive_confirmation']}\n"
+            f"  - auto_execute_plan_steps: {pol['auto_execute_plan_steps']}\n"
+            f"  - max_recovery_attempts: {pol['max_recovery_attempts']}\n"
+            f"  - verify_steps: {pol['verify_steps']}"
+        )
 
     def set_memory_enabled(self, enabled, persist=True):
         self.memory_enabled = bool(enabled)
@@ -1306,7 +2493,23 @@ class WindowsAgent:
                         if isinstance(row, dict):
                             merged.append(row)
             if merged:
-                self.conversation_history = merged[-self.max_memory_items:]
+                cleaned = []
+                for row in merged[-self.max_memory_items:]:
+                    if not isinstance(row, dict):
+                        continue
+                    u = self._safe_memory_text(row.get("user") or "", max_len=900)
+                    a = self._safe_memory_text(row.get("assistant") or "", max_len=1500)
+                    if not u and not a:
+                        continue
+                    cleaned.append(
+                        {
+                            "timestamp": row.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+                            "user": u,
+                            "assistant": a,
+                            "keywords": row.get("keywords") or self._extract_keywords(u),
+                        }
+                    )
+                self.conversation_history = cleaned[-self.max_memory_items:]
         except Exception:
             self.conversation_history = []
 
@@ -1319,6 +2522,490 @@ class WindowsAgent:
                 json.dump(self.conversation_history[-self.max_memory_items:], f, indent=2)
         except Exception:
             pass
+
+    def _safe_memory_text(self, text, max_len=1600):
+        raw = str(text or "")
+        if validate_memory_text is None:
+            cleaned = re.sub(r"\s+", " ", raw).strip()[: max(80, int(max_len))]
+            return cleaned
+        ok, reason, cleaned = validate_memory_text(raw, max_len=max_len)
+        if not ok:
+            self.memory_safety_block_count = int(getattr(self, "memory_safety_block_count", 0)) + 1
+            self._audit("memory_safety", "blocked", {"reason": reason, "sample": cleaned[:120]})
+            return ""
+        return cleaned
+
+    def load_session_recaps(self):
+        self.session_recaps = []
+        if not self.memory_enabled:
+            return
+        try:
+            if os.path.exists(self.session_recaps_file):
+                with open(self.session_recaps_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    cleaned = []
+                    for item in data:
+                        if not isinstance(item, dict):
+                            continue
+                        summary = self._safe_memory_text(item.get("summary") or "", max_len=1200)
+                        if not summary:
+                            continue
+                        cleaned.append(
+                            {
+                                "timestamp": item.get("timestamp") or datetime.now().isoformat(timespec="seconds"),
+                                "mode": (item.get("mode") or "chat").strip().lower(),
+                                "summary": summary[:1200],
+                                "keywords": item.get("keywords") or self._extract_keywords(summary),
+                            }
+                        )
+                    self.session_recaps = cleaned[-self.max_session_recaps:]
+        except Exception:
+            self.session_recaps = []
+
+    def _save_session_recaps(self):
+        try:
+            os.makedirs(os.path.dirname(self.session_recaps_file), exist_ok=True)
+            with open(self.session_recaps_file, "w", encoding="utf-8") as f:
+                json.dump(self.session_recaps[-self.max_session_recaps:], f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _append_session_recap(self, mode, summary):
+        if not self.memory_enabled:
+            return
+        text = self._safe_memory_text(summary or "", max_len=1200)
+        if not text:
+            return
+        entry = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "mode": (mode or "chat").strip().lower(),
+            "summary": text[:1200],
+            "keywords": self._extract_keywords(text),
+        }
+        self.session_recaps.append(entry)
+        self.session_recaps = self.session_recaps[-self.max_session_recaps:]
+        self._save_session_recaps()
+
+    def load_task_outcomes(self):
+        self.task_outcomes = []
+        self.failure_patterns = {}
+        if not self.memory_enabled:
+            return
+        try:
+            if not os.path.exists(self.task_outcomes_file):
+                return
+            with open(self.task_outcomes_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return
+            events = data.get("events") or []
+            if isinstance(events, list):
+                cleaned = []
+                for row in events:
+                    if not isinstance(row, dict):
+                        continue
+                    action = (row.get("action") or "").strip().lower()
+                    status = (row.get("status") or "").strip().lower()
+                    if not action or not status:
+                        continue
+                    cleaned.append(
+                        {
+                            "ts": row.get("ts") or datetime.now().isoformat(timespec="seconds"),
+                            "action": action[:80],
+                            "status": status[:40],
+                            "reason": self._safe_memory_text(row.get("reason") or "", max_len=220),
+                            "details": row.get("details") if isinstance(row.get("details"), dict) else {},
+                        }
+                    )
+                self.task_outcomes = cleaned[-self.max_task_outcomes:]
+            patterns = data.get("failure_patterns") or {}
+            if isinstance(patterns, dict):
+                self.failure_patterns = {str(k): int(v) for k, v in patterns.items() if str(k).strip()}
+        except Exception:
+            self.task_outcomes = []
+            self.failure_patterns = {}
+
+    def _save_task_outcomes(self):
+        try:
+            os.makedirs(os.path.dirname(self.task_outcomes_file), exist_ok=True)
+            payload = {
+                "events": self.task_outcomes[-self.max_task_outcomes:],
+                "failure_patterns": self.failure_patterns,
+            }
+            with open(self.task_outcomes_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def load_trajectory_memory(self):
+        self.trajectory_memory = []
+        self._trajectory_source_cursor = len(self.task_outcomes)
+        if not self.memory_enabled:
+            return
+        try:
+            if not os.path.exists(self.trajectory_memory_file):
+                return
+            with open(self.trajectory_memory_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            rows = []
+            cursor = 0
+            if isinstance(data, dict):
+                rows = data.get("trajectories") or []
+                cursor = int(data.get("source_cursor", 0) or 0)
+            elif isinstance(data, list):
+                rows = data
+            cleaned = []
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                summary = self._safe_memory_text(row.get("summary") or "", max_len=1400)
+                if not summary:
+                    continue
+                cleaned.append(
+                    {
+                        "ts": row.get("ts") or datetime.now().isoformat(timespec="seconds"),
+                        "span": row.get("span") or "",
+                        "summary": summary,
+                        "keywords": row.get("keywords") or self._extract_keywords(summary),
+                        "failure_tags": row.get("failure_tags") if isinstance(row.get("failure_tags"), list) else [],
+                        "actions": row.get("actions") if isinstance(row.get("actions"), list) else [],
+                    }
+                )
+            self.trajectory_memory = cleaned[-self.max_trajectories:]
+            self._trajectory_source_cursor = max(0, min(len(self.task_outcomes), cursor if cursor > 0 else len(self.task_outcomes)))
+        except Exception:
+            self.trajectory_memory = []
+            self._trajectory_source_cursor = len(self.task_outcomes)
+
+    def _save_trajectory_memory(self):
+        try:
+            os.makedirs(os.path.dirname(self.trajectory_memory_file), exist_ok=True)
+            payload = {
+                "source_cursor": int(self._trajectory_source_cursor),
+                "trajectories": self.trajectory_memory[-self.max_trajectories:],
+            }
+            with open(self.trajectory_memory_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+        except Exception:
+            pass
+
+    def _summarize_outcome_chunk(self, rows):
+        if not rows:
+            return ""
+        preview = []
+        for r in rows[-20:]:
+            preview.append(
+                f"[{r.get('ts','')}] action={r.get('action','')} status={r.get('status','')} reason={r.get('reason','')}"
+            )
+        text = "\n".join(preview)
+        if not text:
+            return ""
+        try:
+            summary = self._call_ai(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "Compress this task trajectory into operational memory. "
+                            "Return 5-8 bullets: wins, repeated failures, root causes, and best next strategies."
+                        ),
+                    },
+                    {"role": "user", "content": text[:5000]},
+                ]
+            ).strip()
+        except Exception:
+            summary = ""
+        if not summary:
+            summary = text.replace("\n", " ")[:900]
+        return self._safe_memory_text(summary, max_len=1400)
+
+    def _maybe_compact_trajectory(self):
+        if not self.memory_enabled:
+            return
+        cursor = max(0, int(getattr(self, "_trajectory_source_cursor", 0)))
+        if len(self.task_outcomes) - cursor < max(3, int(self.trajectory_compact_trigger)):
+            return
+        chunk = self.task_outcomes[cursor:]
+        if not chunk:
+            return
+        summary = self._summarize_outcome_chunk(chunk)
+        if not summary:
+            self._trajectory_source_cursor = len(self.task_outcomes)
+            return
+        failure_tags = []
+        actions = []
+        for row in chunk:
+            action = row.get("action") or ""
+            if action and action not in actions:
+                actions.append(action)
+            if row.get("status") == "failed":
+                failure_tags.append(self._classify_failure_reason(row.get("reason") or ""))
+        traj = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "span": f"{chunk[0].get('ts','')} -> {chunk[-1].get('ts','')}",
+            "summary": summary,
+            "keywords": self._extract_keywords(summary),
+            "failure_tags": list(dict.fromkeys([t for t in failure_tags if t]))[:10],
+            "actions": actions[:12],
+        }
+        self.trajectory_memory.append(traj)
+        self.trajectory_memory = self.trajectory_memory[-self.max_trajectories:]
+        self._trajectory_source_cursor = len(self.task_outcomes)
+        self._save_trajectory_memory()
+
+    def _build_trajectory_context(self, user_input, limit=2):
+        if not self.memory_enabled or not self.trajectory_memory:
+            return ""
+        qk = set(self._extract_keywords(user_input))
+        ranked = []
+        total = len(self.trajectory_memory)
+        for idx, row in enumerate(self.trajectory_memory):
+            keywords = set(row.get("keywords") or [])
+            overlap = len(qk.intersection(keywords))
+            recency = (idx + 1) / max(1, total)
+            score = overlap * 2.2 + recency
+            if qk and overlap <= 0:
+                score -= 0.6
+            ranked.append((score, row))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = [row for _, row in ranked[:max(1, int(limit))]]
+        if not selected:
+            return ""
+        lines = []
+        for row in selected:
+            ts = row.get("ts") or ""
+            span = row.get("span") or ""
+            summary = (row.get("summary") or "").strip()
+            if summary:
+                lines.append(f"- [{ts}] ({span}) {summary}")
+        if not lines:
+            return ""
+        return ("Trajectory memory (compressed execution lessons):\n" + "\n".join(lines))[:1700]
+
+    def _trajectory_status_text(self):
+        return (
+            "Trajectory memory:\n"
+            f"  - trajectories: {len(self.trajectory_memory)}\n"
+            f"  - source_cursor: {int(self._trajectory_source_cursor)}\n"
+            f"  - compact_trigger: {int(self.trajectory_compact_trigger)}\n"
+            f"  - file: {self.trajectory_memory_file}"
+        )
+
+    def _trajectory_recent_text(self, limit=6):
+        rows = self.trajectory_memory[-max(1, int(limit)):]
+        if not rows:
+            return "(no trajectories)"
+        out = []
+        for row in rows:
+            ts = row.get("ts") or ""
+            summary = (row.get("summary") or "").replace("\n", " ").strip()
+            out.append(f"- [{ts}] {summary[:220]}")
+        return "\n".join(out)
+
+    def _classify_failure_reason(self, text):
+        t = (text or "").strip().lower()
+        if not t:
+            return "unknown"
+        checks = [
+            ("permission_denied", r"\b(permission|access is denied|denied|not allowed|blocked)\b"),
+            ("not_found", r"\b(not found|could not find|no such|doesn't exist|does not exist)\b"),
+            ("timeout", r"\b(timeout|timed out|deadline)\b"),
+            ("network", r"\b(network|internet|dns|connection|unreachable)\b"),
+            ("auth", r"\b(auth|api key|unauthorized|forbidden|401|403)\b"),
+            ("validation", r"\b(invalid|missing|required|empty|unsupported|bad request)\b"),
+            ("runtime_error", r"\b(error|exception|traceback|failed)\b"),
+        ]
+        for label, pattern in checks:
+            if re.search(pattern, t, re.IGNORECASE):
+                return label
+        return "unknown"
+
+    def _record_task_outcome(self, action, status, reason="", details=None):
+        if not self.memory_enabled:
+            return
+        action = (action or "").strip().lower()
+        status = (status or "").strip().lower()
+        if not action or not status:
+            return
+        entry = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "action": action[:80],
+            "status": status[:40],
+            "reason": self._safe_memory_text(reason or "", max_len=220),
+            "details": details if isinstance(details, dict) else {},
+        }
+        self.task_outcomes.append(entry)
+        self.task_outcomes = self.task_outcomes[-self.max_task_outcomes:]
+        if status in {"failed", "blocked", "error", "timeout", "denied", "partial"}:
+            tag = self._classify_failure_reason(reason)
+            key = f"{action}:{tag}"
+            self.failure_patterns[key] = int(self.failure_patterns.get(key, 0)) + 1
+        if len(self.task_outcomes) % 5 == 0:
+            self._save_task_outcomes()
+        self._maybe_compact_trajectory()
+
+    def _record_task_outcome_from_audit(self, action, status, details=None):
+        action_l = (action or "").strip().lower()
+        status_l = (status or "").strip().lower()
+        if not action_l or not status_l:
+            return
+        success_statuses = {"allowed", "ok", "approved", "granted", "completed", "done"}
+        failure_statuses = {"blocked", "error", "denied", "timeout", "partial"}
+        mapped = ""
+        if status_l in success_statuses:
+            mapped = "success"
+        elif status_l in failure_statuses:
+            mapped = "failed"
+        elif status_l in {"permission_requested", "requested"}:
+            mapped = "pending"
+        if not mapped:
+            return
+        reason = ""
+        if isinstance(details, dict):
+            reason = (
+                str(details.get("reason") or details.get("error") or details.get("message") or "").strip()
+                or str(details.get("target") or "").strip()
+            )
+        self._record_task_outcome(action_l, mapped, reason=reason, details=details if isinstance(details, dict) else {})
+
+    def _task_outcomes_status_text(self):
+        rows = list(self.task_outcomes or [])
+        if not rows:
+            return "No task outcomes recorded yet."
+        total = len(rows)
+        success = len([r for r in rows if r.get("status") == "success"])
+        failed = len([r for r in rows if r.get("status") == "failed"])
+        pending = len([r for r in rows if r.get("status") == "pending"])
+        success_rate = (success / max(1, success + failed)) * 100.0
+        top_fail = sorted(self.failure_patterns.items(), key=lambda kv: kv[1], reverse=True)[:5]
+        lines = [
+            "Task outcomes:",
+            f"  - total: {total}",
+            f"  - success: {success}",
+            f"  - failed: {failed}",
+            f"  - pending: {pending}",
+            f"  - success_rate: {success_rate:.1f}%",
+        ]
+        if top_fail:
+            lines.append("  - top_failures:")
+            for key, count in top_fail:
+                lines.append(f"    * {key} ({count})")
+        return "\n".join(lines)
+
+    def _task_outcomes_recent_text(self, limit=12):
+        rows = self.task_outcomes[-max(1, int(limit)):]
+        if not rows:
+            return "(no recent outcomes)"
+        out = []
+        for row in rows:
+            ts = row.get("ts") or ""
+            action = row.get("action") or "task"
+            status = row.get("status") or "unknown"
+            reason = (row.get("reason") or "").strip()
+            suffix = f" | {reason[:120]}" if reason else ""
+            out.append(f"- [{ts}] {action}: {status}{suffix}")
+        return "\n".join(out)
+
+    def _build_failure_playbook_text(self, action, reason="", details=None):
+        action_l = (action or "").strip().lower()
+        reason_tag = self._classify_failure_reason(reason)
+        if not action_l:
+            action_l = "task"
+        lines = [f"Playbook for `{action_l}` failure ({reason_tag}):"]
+        if action_l in {"open_app", "close_app"}:
+            lines.extend(
+                [
+                    "1. Check the exact app name and try the executable name if needed.",
+                    "2. Verify the app appears in running apps list before close/open attempts.",
+                    "3. Retry with a simpler command: `open <app>` or `close <app>`.",
+                ]
+            )
+        elif action_l.startswith("file") or action_l in {"create_pdf", "create_word_doc", "file_mutation"}:
+            lines.extend(
+                [
+                    "1. Confirm target path exists and you have write permissions.",
+                    "2. Avoid special characters in file names and retry.",
+                    "3. If blocked, approve the permission prompt and run again.",
+                ]
+            )
+        elif action_l in {"search_on_app", "open_url", "web_search"}:
+            lines.extend(
+                [
+                    "1. Verify internet connectivity and retry with a direct URL/query.",
+                    "2. Try default browser if a specific browser hint fails.",
+                    "3. If timeout persists, shorten query and rerun.",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "1. Retry with a shorter, explicit command.",
+                    "2. Confirm required permission prompts are approved.",
+                    "3. If still failing, switch to step-by-step execution.",
+                ]
+            )
+        if reason_tag == "permission_denied":
+            lines.append("Extra: permission was denied/blocked, so allow-once is required for this action.")
+        if reason_tag == "not_found":
+            lines.append("Extra: target could not be found, so use exact names or full paths.")
+        if reason_tag == "timeout":
+            lines.append("Extra: timeout detected, so retry with fewer steps per command.")
+        return "\n".join(lines)
+
+    def _playbook_for_query_text(self, query):
+        q = (query or "").strip().lower()
+        if not q:
+            top = sorted(self.failure_patterns.items(), key=lambda kv: kv[1], reverse=True)[:1]
+            if top:
+                action = top[0][0].split(":", 1)[0]
+                return self._build_failure_playbook_text(action, reason=top[0][0])
+            return "No failure playbook data yet."
+        rows = [r for r in reversed(self.task_outcomes) if q in (r.get("action") or "") or q in (r.get("reason") or "").lower()]
+        if rows:
+            row = rows[0]
+            return self._build_failure_playbook_text(row.get("action"), reason=row.get("reason"), details=row.get("details"))
+        if q in {"open", "open_app", "close", "close_app"}:
+            return self._build_failure_playbook_text("open_app" if "open" in q else "close_app", reason=q)
+        if q in {"file", "pdf", "doc", "word", "mutation"}:
+            return self._build_failure_playbook_text("file_mutation", reason=q)
+        if q in {"web", "search", "url", "browser"}:
+            return self._build_failure_playbook_text("open_url", reason=q)
+        return self._build_failure_playbook_text("task", reason=q)
+
+    def _maybe_attach_failure_playbook(self, response_text, action_hint="", details=None):
+        text = str(response_text or "")
+        if not text:
+            return text
+        fail = bool(re.search(r"\b(failed|error|could not|unable|blocked|denied|timed out|skipped)\b", text, re.IGNORECASE))
+        if not fail:
+            return text
+        playbook = self._build_failure_playbook_text(action_hint or "task", reason=text, details=details if isinstance(details, dict) else {})
+        return text.rstrip() + "\n\n" + playbook
+
+    def _build_session_recap_context(self, user_input, limit=2):
+        if not self.memory_enabled or not self.session_recaps:
+            return ""
+        qk = set(self._extract_keywords(user_input))
+        ranked = []
+        total = len(self.session_recaps)
+        for idx, row in enumerate(self.session_recaps):
+            overlap = len(qk.intersection(set(row.get("keywords") or [])))
+            recency = (idx + 1) / max(1, total)
+            score = (overlap * 2.0) + recency
+            if overlap <= 0 and qk:
+                score -= 0.7
+            ranked.append((score, row))
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        selected = [row for _, row in ranked[:max(1, int(limit))] if row.get("summary")]
+        if not selected:
+            return ""
+        lines = []
+        for row in selected:
+            ts = row.get("timestamp") or ""
+            mode = row.get("mode") or "chat"
+            lines.append(f"- [{ts}] ({mode}) {row.get('summary', '')}")
+        return ("Session recaps (compressed long-term context):\n" + "\n".join(lines))[:1400]
 
     def _append_memory_journal(self, entry):
         if not self.memory_enabled:
@@ -1334,6 +3021,8 @@ class WindowsAgent:
         if not self.memory_enabled:
             self.learned_facts = []
             self.adaptive_examples = []
+            if self.hermes_memory is not None:
+                self.hermes_memory.insights = []
             return
         self.learned_facts = []
         self.adaptive_examples = []
@@ -1369,6 +3058,11 @@ class WindowsAgent:
                     self.adaptive_examples = cleaned[-self.max_adaptive_examples:]
         except Exception:
             self.adaptive_examples = []
+        try:
+            if self.hermes_memory is not None:
+                self.hermes_memory.load()
+        except Exception:
+            pass
         self._apply_historical_feedback_scores()
 
     def load_user_profile(self):
@@ -1376,8 +3070,8 @@ class WindowsAgent:
         default = {
             "response_style": "balanced",   # "brief" | "detailed" | "balanced"
             "format_preference": "mixed",   # "bullets" | "prose" | "mixed"
-            "good_lengths": [],             # char lengths of 👍 responses (last 30)
-            "bad_patterns": [],             # short description of 👎 patterns (last 20)
+            "good_lengths": [],             # char lengths of ðŸ‘ responses (last 30)
+            "bad_patterns": [],             # short description of ðŸ‘Ž patterns (last 20)
             "domains": {},                  # {"coding": 12, "design": 5, ...}
             "name": "",
             "language": "en",
@@ -1418,7 +3112,7 @@ class WindowsAgent:
             else:
                 self.user_profile["response_style"] = "balanced"
             # Infer format from bullet point density in liked responses
-            bullet_count = len(re.findall(r'^\s*[-*•]', assistant_text, re.MULTILINE))
+            bullet_count = len(re.findall(r'^\s*[-*â€¢]', assistant_text, re.MULTILINE))
             lines = max(1, assistant_text.count('\n') + 1)
             if bullet_count / lines > 0.35:
                 pref = "bullets"
@@ -1434,7 +3128,7 @@ class WindowsAgent:
             self.user_profile["format_preference"] = max(votes, key=votes.get)
         elif rating == "bad" and assistant_text:
             # Record what pattern got thumbed down (length + format tag)
-            bullet_count = len(re.findall(r'^\s*[-*•]', assistant_text, re.MULTILINE))
+            bullet_count = len(re.findall(r'^\s*[-*â€¢]', assistant_text, re.MULTILINE))
             tag = "long-bullets" if bullet_count > 4 and len(assistant_text) > 400 else \
                   "long-prose" if len(assistant_text) > 400 else \
                   "short" if len(assistant_text) < 80 else "medium"
@@ -1462,7 +3156,7 @@ class WindowsAgent:
             if re.search(pattern, user_text, re.IGNORECASE):
                 domains[domain] = domains.get(domain, 0) + 1
         profile["domains"] = domains
-        # No save here — saved at session end to avoid disk thrash
+        # No save here â€” saved at session end to avoid disk thrash
 
     def _build_profile_prompt(self):
         """Return a concise system prompt block describing the user's preferences."""
@@ -1476,11 +3170,11 @@ class WindowsAgent:
         style = p.get("response_style", "balanced")
         fmt = p.get("format_preference", "mixed")
         if style == "brief":
-            parts.append("This user prefers SHORT, direct answers — avoid long explanations unless asked.")
+            parts.append("This user prefers SHORT, direct answers â€” avoid long explanations unless asked.")
         elif style == "detailed":
             parts.append("This user prefers DETAILED, thorough answers with full context.")
         else:
-            parts.append("This user prefers balanced answers — not too short, not too long.")
+            parts.append("This user prefers balanced answers â€” not too short, not too long.")
         if fmt == "bullets":
             parts.append("Format preference: use bullet points and structured lists.")
         elif fmt == "prose":
@@ -1571,6 +3265,31 @@ class WindowsAgent:
         assistant = (payload.get("assistant") or "").strip()
         correction = (payload.get("correction") or "").strip()
         self._update_profile_from_feedback(rating, user, assistant)
+        if self.hermes_memory is not None:
+            try:
+                if rating == "fix" and correction:
+                    self.hermes_memory.add_insight(
+                        kind="feedback_fix",
+                        text=f"When asked similar to '{user[:120]}', prefer this corrected direction: {correction[:220]}",
+                        keywords=self._extract_keywords(user + " " + correction),
+                        score_delta=1.8,
+                    )
+                elif rating == "bad" and user:
+                    self.hermes_memory.add_insight(
+                        kind="feedback_avoid",
+                        text=f"Avoid the prior response style for requests like: {user[:180]}",
+                        keywords=self._extract_keywords(user),
+                        score_delta=1.0,
+                    )
+                elif rating == "good" and user and assistant:
+                    self.hermes_memory.add_insight(
+                        kind="feedback_good",
+                        text=f"Successful response pattern exists for requests like: {user[:180]}",
+                        keywords=self._extract_keywords(user),
+                        score_delta=0.35,
+                    )
+            except Exception:
+                pass
         if not user:
             return
         if rating == "fix" and correction:
@@ -1850,7 +3569,7 @@ class WindowsAgent:
             return False
         if screen_task_intent:
             return False
-        # Never drop context when there is active conversation history â
+        # Never drop context when there is active conversation history Ã¢Â€Â”
         # follow-up questions are short by nature ("what about him?", "explain more")
         # and losing history causes the agent to forget who/what was discussed.
         if self.conversation_history:
@@ -1900,6 +3619,7 @@ class WindowsAgent:
             }
             with open(self.audit_log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self._record_task_outcome_from_audit(action, status, details if isinstance(details, dict) else {})
         except Exception:
             pass
 
@@ -1931,7 +3651,7 @@ class WindowsAgent:
             flags=re.IGNORECASE,
         ):
             return False
-        # rename/move/delete/copy with any target are always file mutations â no extra keyword needed
+        # rename/move/delete/copy with any target are always file mutations Ã¢Â€Â” no extra keyword needed
         if re.match(r"^(rename|move|delete|remove|copy)\b", t, flags=re.IGNORECASE):
             non_file_words = r"\b(research|search|plan|plans|more|further|sense|sure|time|money|request|decision|effort|progress|question|improvement)\b"
             if re.search(non_file_words, t[:60], flags=re.IGNORECASE):
@@ -1961,13 +3681,15 @@ class WindowsAgent:
         return out[:12]
 
     def _remember_turn(self, user_text, assistant_text):
-        if not self.memory_enabled:
+        safe_user = self._safe_memory_text(user_text or "", max_len=900)
+        safe_assistant = self._safe_memory_text(assistant_text or "", max_len=1500)
+        if not safe_user and not safe_assistant:
             return
         entry = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "user": user_text,
-            "assistant": assistant_text,
-            "keywords": self._extract_keywords(user_text),
+            "user": safe_user,
+            "assistant": safe_assistant,
+            "keywords": self._extract_keywords(safe_user),
         }
         # Store in mode-specific history
         _mode = getattr(self, "input_mode", "chat")
@@ -1977,12 +3699,127 @@ class WindowsAgent:
         else:
             self.conversation_history.append(entry)
             self.conversation_history = self.conversation_history[-self.max_memory_items:]
-        self._append_memory_journal(entry)
-        # Snapshot less frequently to keep response path fast.
-        if len(self.conversation_history) % self._memory_snapshot_every == 0:
-            self.save_memory()
-        self._learn_from_turn(user_text, assistant_text)
-        self._maybe_compact_memory()
+        if self.memory_enabled:
+            self._append_memory_journal(entry)
+            # Snapshot less frequently to keep response path fast.
+            active_hist = self.task_conversation_history if _mode == "task" else self.conversation_history
+            if len(active_hist) % self._memory_snapshot_every == 0 and _mode != "task":
+                self.save_memory()
+            self._learn_from_turn(user_text, assistant_text)
+            self._maybe_compact_memory(mode=_mode)
+
+    def _capture_turn(self, user_text, assistant_text, remember=True):
+        self.last_user_message = str(user_text or "")[:1200]
+        self.last_assistant_message = str(assistant_text or "")[:5000]
+        self._update_topic_anchor(user_text, assistant_text)
+        if remember:
+            try:
+                self._remember_turn(user_text, assistant_text)
+            except Exception:
+                pass
+
+    def _extract_topic_anchor(self, user_text):
+        t = str(user_text or "").strip()
+        if not t:
+            return "", []
+        # Remove noisy helper words while keeping subject-bearing tokens.
+        cleaned = re.sub(
+            r"\b(and|also|then|what|about|how|do|does|did|can|could|should|would|please|explain|clarify|elaborate|"
+            r"tell|me|you|your|that|this|it|them|those|these|one|ones|more|details|detail|use|using)\b",
+            " ",
+            t,
+            flags=re.IGNORECASE,
+        )
+        cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,.?")
+        kws = self._extract_keywords(cleaned or t)
+        if len(kws) < 2:
+            kws = self._extract_keywords(t)
+        anchor = " ".join(kws[:8]).strip()
+        return (anchor[:140], kws[:10])
+
+    def _looks_like_topic_switch(self, user_input):
+        t = str(user_input or "").strip().lower()
+        if not t:
+            return False
+        if re.search(r"\b(new topic|another topic|different topic|change topic|switch topic|forget previous|start over)\b", t):
+            return True
+        return False
+
+    def _is_ambiguous_followup_query(self, user_input):
+        q = str(user_input or "").strip()
+        if not q:
+            return False
+        if self._looks_like_topic_switch(q):
+            return False
+        if re.match(r"^\s*(and|also|then|so)\b", q, flags=re.IGNORECASE):
+            return True
+        if re.match(r"^\s*(what|how|why|when|where|which)\s+about\b", q, flags=re.IGNORECASE):
+            return True
+        if re.search(r"\b(it|this|that|those|these|them|that one|this one)\b", q, flags=re.IGNORECASE):
+            return True
+        if re.search(r"\b(how do i use|how to use|how to do that|how can i use|how can i do that)\b", q, flags=re.IGNORECASE):
+            return True
+        words = q.split()
+        if len(words) <= 10 and re.match(r"^\s*(what|how|why|when|where|which|can|do|does|is|are)\b", q, flags=re.IGNORECASE):
+            return True
+        return False
+
+    def _topic_anchor_is_fresh(self):
+        if not self.topic_anchor_text:
+            return False
+        age = max(0.0, time.time() - float(self.topic_anchor_updated_at or 0.0))
+        return age <= max(60, int(self.topic_anchor_ttl_sec))
+
+    def _update_topic_anchor(self, user_text, assistant_text):
+        u = str(user_text or "").strip()
+        if not u:
+            return
+        if self._looks_like_topic_switch(u):
+            self.topic_anchor_text = ""
+            self.topic_anchor_keywords = []
+            self.topic_anchor_updated_at = time.time()
+            return
+        # Don't replace anchor with trivial follow-up wording.
+        if self._is_ambiguous_followup_query(u) and self.topic_anchor_text:
+            self.topic_anchor_updated_at = time.time()
+            return
+        anchor, kws = self._extract_topic_anchor(u)
+        if anchor:
+            self.topic_anchor_text = anchor
+            self.topic_anchor_keywords = list(kws or [])
+            self.topic_anchor_updated_at = time.time()
+
+    def _topic_anchor_hint(self, user_input):
+        if not self._topic_anchor_is_fresh():
+            return ""
+        if self._looks_like_topic_switch(user_input):
+            return ""
+        if not self._is_ambiguous_followup_query(user_input):
+            return ""
+        _last_ans = (self.last_assistant_message or "").strip().replace("\n", " ")
+        return (
+            "TOPIC ANCHOR: Keep continuity with the active conversation subject unless the user explicitly switches topics. "
+            f"Current anchor: \"{self.topic_anchor_text}\". "
+            f"Recent assistant context: \"{_last_ans[:260]}\"."
+        )
+
+    def _topic_anchor_status_text(self):
+        if not self.topic_anchor_text:
+            return "Context anchor: none."
+        age = max(0.0, time.time() - float(self.topic_anchor_updated_at or 0.0))
+        return (
+            "Context anchor:\n"
+            f"  - anchor: {self.topic_anchor_text}\n"
+            f"  - keywords: {', '.join(self.topic_anchor_keywords[:8]) if self.topic_anchor_keywords else '(none)'}\n"
+            f"  - age_sec: {int(age)}\n"
+            f"  - ttl_sec: {int(self.topic_anchor_ttl_sec)}\n"
+            f"  - active: {self._topic_anchor_is_fresh()}"
+        )
+
+    def _reset_topic_anchor(self):
+        self.topic_anchor_text = ""
+        self.topic_anchor_keywords = []
+        self.topic_anchor_updated_at = 0.0
 
     def _extract_user_facts(self, user_text):
         text = (user_text or "").strip()
@@ -2005,6 +3842,26 @@ class WindowsAgent:
             if value:
                 facts.append({"kind": kind, "value": value[:120]})
         return facts
+
+    def _extract_learning_rules(self, user_text):
+        text = (user_text or "").strip()
+        if not text:
+            return []
+        out = []
+        patterns = [
+            (r"\b(?:please\s+)?always\s+(.{3,140})", "always_rule"),
+            (r"\b(?:please\s+)?(?:don't|do not|never)\s+(.{3,140})", "avoid_rule"),
+            (r"\b(?:i prefer|prefer)\s+(.{3,120})", "preference_rule"),
+            (r"\bremember\s+(?:that\s+)?(.{3,120})", "memory_rule"),
+        ]
+        for pattern, kind in patterns:
+            m = re.search(pattern, text, flags=re.IGNORECASE)
+            if not m:
+                continue
+            value = (m.group(1) or "").strip(" .,!?:;")
+            if value:
+                out.append({"kind": kind, "value": value[:180]})
+        return out
 
     def _learn_from_turn(self, user_text, assistant_text):
         if not self.memory_enabled:
@@ -2047,20 +3904,34 @@ class WindowsAgent:
         if changed:
             self.learned_facts = self.learned_facts[-1000:]
             self._save_learned_facts()
+        if self.hermes_memory is not None:
+            try:
+                rules = self._extract_learning_rules(user_text)
+                for rule in rules:
+                    insight_text = f"For this user, {rule.get('value', '')}"
+                    self.hermes_memory.add_insight(
+                        kind=rule.get("kind") or "rule",
+                        text=insight_text,
+                        keywords=(rule.get("value") or ""),
+                        score_delta=1.1,
+                    )
+            except Exception:
+                pass
 
-    def _maybe_compact_memory(self):
+    def _maybe_compact_memory(self, mode="chat"):
         if not self.memory_enabled:
             return
         if self.memory_summary_trigger <= 0:
             return
-        if len(self.conversation_history) < self.memory_summary_trigger:
+        history = self.task_conversation_history if (mode == "task") else self.conversation_history
+        if len(history) < self.memory_summary_trigger:
             return
         if time.time() - self._last_summary_ts < 60:
             return
         keep_last = max(2, self.memory_summary_keep_last)
-        if len(self.conversation_history) <= keep_last + 2:
+        if len(history) <= keep_last + 2:
             return
-        to_summarize = self.conversation_history[:-keep_last]
+        to_summarize = history[:-keep_last]
         if not to_summarize:
             return
         text_lines = []
@@ -2078,8 +3949,12 @@ class WindowsAgent:
             "keywords": self._extract_keywords(summary),
             "summary": True,
         }
-        self.conversation_history = [summary_entry] + self.conversation_history[-keep_last:]
-        self.save_memory()
+        compacted = [summary_entry] + history[-keep_last:]
+        if mode == "task":
+            self.task_conversation_history = compacted
+        else:
+            self.conversation_history = compacted
+            self.save_memory()
         self._last_summary_ts = time.time()
 
     def _summarize_memory_block(self, text):
@@ -2103,6 +3978,36 @@ class WindowsAgent:
         except Exception:
             compact = text.replace("\n", " ")
             return compact[:500]
+
+    def _generate_session_recap_from_history(self, history, mode="chat"):
+        rows = list(history or [])
+        if len(rows) < max(2, int(self.session_recap_trigger)):
+            return ""
+        lines = []
+        for item in rows[-18:]:
+            lines.append(f"User: {(item.get('user') or '')[:260]}")
+            lines.append(f"Assistant: {(item.get('assistant') or '')[:360]}")
+        payload = "\n".join(lines).strip()
+        if not payload:
+            return ""
+        prompt = (
+            f"Create a compact recap for future {mode} context. "
+            "Keep goals, decisions, constraints, preferences, files/apps involved, and unresolved items. "
+            "Return 5-8 bullet points."
+        )
+        try:
+            recap = self._call_ai(
+                [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": payload[:4200]},
+                ]
+            ).strip()
+        except Exception:
+            recap = ""
+        if not recap:
+            flat = payload.replace("\n", " ")
+            recap = flat[:650]
+        return recap[:1200]
 
     def _retrieve_relevant_facts(self, user_input, limit=6):
         if not self.memory_enabled:
@@ -2132,7 +4037,16 @@ class WindowsAgent:
             lines.append(f"- {kind}: {value}")
         return "User long-term memory:\n" + "\n".join(lines)
 
+    def _build_hermes_learning_context(self, user_input):
+        if not self.memory_enabled or self.hermes_memory is None:
+            return ""
+        try:
+            return self.hermes_memory.render_context(user_input, limit=4, max_chars=900)
+        except Exception:
+            return ""
+
     def _memory_status_text(self):
+        insights_count = len(getattr(self.hermes_memory, "insights", []) or [])
         return (
             "Memory status:\n"
             f"  - enabled: {self.memory_enabled}\n"
@@ -2141,10 +4055,22 @@ class WindowsAgent:
             f"  - conversation_history: {len(self.conversation_history)} items\n"
             f"  - learned_facts: {len(self.learned_facts)} items\n"
             f"  - adaptive_examples: {len(self.adaptive_examples)} items\n"
+            f"  - hermes_insights: {insights_count} items\n"
+            f"  - session_recaps: {len(self.session_recaps)} items\n"
+            f"  - task_outcomes: {len(self.task_outcomes)} items\n"
+            f"  - trajectories: {len(self.trajectory_memory)} items\n"
+            f"  - memory_safety_blocks: {int(self.memory_safety_block_count)}\n"
+            f"  - provider_stats_tracked: {len(self.provider_health)} providers\n"
+            f"  - mcp_route_stats_tracked: {len(self.mcp_route_stats)} actions\n"
             f"  - memory_file: {self.memory_file}\n"
             f"  - memory_journal_file: {self.memory_journal_file}\n"
             f"  - learned_facts_file: {self.learned_facts_file}\n"
-            f"  - adaptive_examples_file: {self.adaptive_examples_file}"
+            f"  - adaptive_examples_file: {self.adaptive_examples_file}\n"
+            f"  - session_recaps_file: {self.session_recaps_file}\n"
+            f"  - task_outcomes_file: {self.task_outcomes_file}\n"
+            f"  - trajectory_memory_file: {self.trajectory_memory_file}\n"
+            f"  - provider_stats_file: {self.provider_stats_file}\n"
+            f"  - mcp_route_stats_file: {self.mcp_route_stats_file}"
         )
 
     def _memory_recent_text(self, limit=8):
@@ -2169,6 +4095,31 @@ class WindowsAgent:
             lines.append(f"- [{ts}] {kind}: {value[:140]}")
         return "\n".join(lines)
 
+    def _memory_insights_text(self, limit=12):
+        insights = list(getattr(self.hermes_memory, "insights", []) or [])[-max(1, int(limit)):]
+        if not insights:
+            return "(no hermes insights)"
+        lines = []
+        for row in insights:
+            kind = (row.get("kind") or "insight").replace("_", " ")
+            text = (row.get("text") or "").strip()
+            ts = row.get("updated_at") or row.get("created_at") or ""
+            score = float(row.get("score", 0))
+            lines.append(f"- [{ts}] ({kind}, score={score:.2f}) {text[:170]}")
+        return "\n".join(lines)
+
+    def _memory_recaps_text(self, limit=8):
+        recaps = self.session_recaps[-max(1, int(limit)):]
+        if not recaps:
+            return "(no session recaps)"
+        lines = []
+        for row in recaps:
+            ts = row.get("timestamp") or ""
+            mode = row.get("mode") or "chat"
+            summary = (row.get("summary") or "").replace("\n", " ").strip()
+            lines.append(f"- [{ts}] ({mode}) {summary[:220]}")
+        return "\n".join(lines)
+
     def _export_memory_bundle(self):
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         out_dir = self.exports_dir
@@ -2180,6 +4131,17 @@ class WindowsAgent:
                 "conversation_history": self.conversation_history[-self.max_memory_items:],
                 "learned_facts": self.learned_facts[-1000:],
                 "adaptive_examples": self.adaptive_examples[-self.max_adaptive_examples:],
+                "hermes_insights": list(getattr(self.hermes_memory, "insights", []) or []),
+                "session_recaps": self.session_recaps[-self.max_session_recaps:],
+                "task_outcomes": self.task_outcomes[-self.max_task_outcomes:],
+                "failure_patterns": self.failure_patterns,
+                "trajectory_memory": self.trajectory_memory[-self.max_trajectories:],
+                "trajectory_source_cursor": int(self._trajectory_source_cursor),
+                "memory_safety_blocks": int(self.memory_safety_block_count),
+                "provider_health": self.provider_health,
+                "provider_cooldown_until": self.provider_cooldown_until,
+                "provider_last_error": self.provider_last_error,
+                "mcp_route_stats": self.mcp_route_stats,
             }
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(payload, f, indent=2, ensure_ascii=False)
@@ -2193,9 +4155,27 @@ class WindowsAgent:
             self.conversation_history = []
             self.learned_facts = []
             self.adaptive_examples = []
+            self.session_recaps = []
+            self.task_outcomes = []
+            self.failure_patterns = {}
+            self.trajectory_memory = []
+            self._trajectory_source_cursor = 0
+            self.memory_safety_block_count = 0
+            self.provider_health = {}
+            self.provider_cooldown_until = {}
+            self.provider_last_error = {}
+            self.mcp_route_stats = {}
+            if self.hermes_memory is not None:
+                self.hermes_memory.insights = []
+                self.hermes_memory.save()
             self.save_memory()
             self._save_learned_facts()
             self._save_adaptive_examples()
+            self._save_session_recaps()
+            self._save_task_outcomes()
+            self._save_trajectory_memory()
+            self._save_provider_stats()
+            self._save_mcp_route_stats()
             try:
                 if os.path.exists(self.memory_journal_file):
                     os.remove(self.memory_journal_file)
@@ -2219,7 +4199,29 @@ class WindowsAgent:
             self.adaptive_examples = []
             self._save_adaptive_examples()
             return "Cleared adaptive training memory."
-        return "Unknown memory bucket. Use: all, history, facts, or adaptive."
+        if key in {"recaps", "recap", "session"}:
+            self.session_recaps = []
+            self._save_session_recaps()
+            return "Cleared session recap memory."
+        if key in {"outcomes", "tasks", "playbooks", "failures"}:
+            self.task_outcomes = []
+            self.failure_patterns = {}
+            self.trajectory_memory = []
+            self._trajectory_source_cursor = 0
+            self._save_task_outcomes()
+            self._save_trajectory_memory()
+            return "Cleared task outcomes, failure playbooks, and trajectory memory."
+        if key in {"trajectory", "trajectories", "traces"}:
+            self.trajectory_memory = []
+            self._trajectory_source_cursor = len(self.task_outcomes)
+            self._save_trajectory_memory()
+            return "Cleared trajectory memory."
+        if key in {"insights", "hermes", "learning"}:
+            if self.hermes_memory is not None:
+                self.hermes_memory.insights = []
+                self.hermes_memory.save()
+            return "Cleared Hermes learning insights memory."
+        return "Unknown memory bucket. Use: all, history, facts, adaptive, recaps, outcomes, trajectory, or insights."
 
     def _retrieve_relevant_memory(self, user_input, limit=5):
         if not self.memory_enabled:
@@ -2906,7 +4908,7 @@ class WindowsAgent:
             return self._open_windows_settings(lower)
 
         # Open common admin/system tools.
-        # Guard: skip if this is a content-writing/file-creation command â the content
+        # Guard: skip if this is a content-writing/file-creation command Ã¢Â€Â” the content
         # body may contain words like "launch", "open", "close" that describe capabilities.
         _core_is_content_task = bool(re.search(
             r"\b(create|make|write|generate|put|save|build)\b[^\n]{0,80}\b(file|doc|document|docx|word|pdf|folder|txt|note)\b"
@@ -3077,6 +5079,111 @@ class WindowsAgent:
             "windows terminal": "windows terminal",
             "cursor": "cursor",
             "copilot": "copilot",
+            "claude": "claude",
+            "claude.ai": "claude",
+            "anthropic claude": "claude",
+            # Microsoft Office
+            "word": "microsoft word",
+            "ms word": "microsoft word",
+            "microsoft word": "microsoft word",
+            "excel": "microsoft excel",
+            "ms excel": "microsoft excel",
+            "microsoft excel": "microsoft excel",
+            "powerpoint": "microsoft powerpoint",
+            "ppt": "microsoft powerpoint",
+            "ms powerpoint": "microsoft powerpoint",
+            "microsoft powerpoint": "microsoft powerpoint",
+            "outlook": "microsoft outlook",
+            "ms outlook": "microsoft outlook",
+            "microsoft outlook": "microsoft outlook",
+            "onenote": "microsoft onenote",
+            "ms onenote": "microsoft onenote",
+            "access": "microsoft access",
+            "ms access": "microsoft access",
+            # Communication & collaboration
+            "zoom": "zoom",
+            "zoom meeting": "zoom",
+            "teams": "microsoft teams",
+            "ms teams": "microsoft teams",
+            "microsoft teams": "microsoft teams",
+            "slack": "slack",
+            "skype": "skype",
+            "msteams": "microsoft teams",
+            # Media players
+            "vlc": "vlc media player",
+            "vlc player": "vlc media player",
+            "vlc media player": "vlc media player",
+            "winamp": "winamp",
+            # Archive tools
+            "7zip": "7-zip",
+            "7-zip": "7-zip",
+            "7 zip": "7-zip",
+            "winrar": "winrar",
+            # Built-in Windows apps
+            "paint": "paint",
+            "ms paint": "paint",
+            "mspaint": "paint",
+            "snipping tool": "snipping tool",
+            "snip": "snipping tool",
+            "snip and sketch": "snip & sketch",
+            "snip & sketch": "snip & sketch",
+            "wordpad": "wordpad",
+            "sticky notes": "sticky notes",
+            "photos": "microsoft photos",
+            "camera": "camera",
+            "maps": "maps",
+            "mail": "mail",
+            "calendar": "calendar",
+            "clock": "clock",
+            "weather": "weather",
+            "store": "microsoft store",
+            "microsoft store": "microsoft store",
+            # Editors / IDEs
+            "pycharm": "pycharm",
+            "intellij": "intellij idea",
+            "intellij idea": "intellij idea",
+            "rider": "rider",
+            "webstorm": "webstorm",
+            "android studio": "android studio",
+            "sublime": "sublime text",
+            "sublime text": "sublime text",
+            "atom": "atom",
+            "brackets": "brackets",
+            # Dev tools
+            "git": "git",
+            "git bash": "git bash",
+            "github desktop": "github desktop",
+            "postman": "postman",
+            "insomnia": "insomnia",
+            "dbeaver": "dbeaver",
+            "wsl": "windows subsystem for linux",
+            # Creative / design
+            "gimp": "gimp",
+            "inkscape": "inkscape",
+            "blender": "blender",
+            "figma": "figma",
+            "audacity": "audacity",
+            "obs": "obs studio",
+            "obs studio": "obs studio",
+            "handbrake": "handbrake",
+            # Productivity
+            "notion": "notion",
+            "obsidian": "obsidian",
+            "trello": "trello",
+            # Remote desktop
+            "anydesk": "anydesk",
+            "teamviewer": "teamviewer",
+            "remote desktop": "remote desktop connection",
+            "rdp": "remote desktop connection",
+            # Gaming
+            "steam": "steam",
+            "epic": "epic games launcher",
+            "epic games": "epic games launcher",
+            "origin": "origin",
+            "ubisoft connect": "ubisoft connect",
+            "uplay": "ubisoft connect",
+            "battle.net": "battle.net",
+            "battlenet": "battle.net",
         }
 
     def _canonicalize_known_app_name(self, app_name):
@@ -3149,8 +5256,13 @@ class WindowsAgent:
         self.start_apps_index = index
         self.start_apps_last_build = time.time()
 
-    def _find_best_index_match(self, normalized_query, mapping):
-        """Find best match key with exact/contains/fuzzy search."""
+    def _find_best_index_match(self, normalized_query, mapping, strict=False):
+        """Find best match key with exact/contains/fuzzy search.
+
+        strict=True: skip substring matching and use a higher fuzzy cutoff (0.85).
+        Use strict=True for Desktop file lookups to prevent app names like "word"
+        from accidentally matching file names like "my word document".
+        """
         if not normalized_query or not mapping:
             return None
         if normalized_query in mapping:
@@ -3158,10 +5270,12 @@ class WindowsAgent:
         # Avoid dangerous fuzzy matches for tiny tokens like "it".
         if len(normalized_query) < 3:
             return None
-        contains = [k for k in mapping if normalized_query in k or k in normalized_query]
-        if contains:
-            return sorted(contains, key=len)[0]
-        fuzzy = get_close_matches(normalized_query, list(mapping.keys()), n=1, cutoff=0.72)
+        if not strict:
+            contains = [k for k in mapping if normalized_query in k or k in normalized_query]
+            if contains:
+                return sorted(contains, key=len)[0]
+        cutoff = 0.85 if strict else 0.72
+        fuzzy = get_close_matches(normalized_query, list(mapping.keys()), n=1, cutoff=cutoff)
         return fuzzy[0] if fuzzy else None
 
     def _guess_open_target(self, raw_input):
@@ -3206,7 +5320,7 @@ class WindowsAgent:
 
         # Strip leading filler
         target = re.sub(r"^\s*(for me|the app|app|application)\s+", "", target, flags=re.IGNORECASE).strip()
-        # Strip trailing filler â loop to handle combinations like "for me please"
+        # Strip trailing filler Ã¢Â€Â” loop to handle combinations like "for me please"
         _filler_tail = re.compile(r"\s*(for me|please|now|on my device|on my computer|on my pc|on pc|can you|could you)\s*$", re.IGNORECASE)
         for _ in range(4):
             new_target = _filler_tail.sub("", target).strip(" ,.-?!")
@@ -3252,19 +5366,7 @@ class WindowsAgent:
                     self._audit("open_app", "error", {"target": key, "mode": "known_path", "path": path})
                     pass
 
-        # Open Desktop files/folders by natural name (e.g., "open Candidature").
-        # Only do this fallback when request does not clearly look like an app name.
-        if not prefer_app_resolution:
-            desktop_item = self._find_desktop_item_path(app_name)
-            if desktop_item:
-                try:
-                    os.startfile(desktop_item)
-                    self._audit("open_app", "allowed", {"target": desktop_item, "mode": "desktop_item"})
-                    return f"Opened {os.path.basename(desktop_item)}"
-                except Exception:
-                    self._audit("open_app", "error", {"target": desktop_item, "mode": "desktop_item"})
-                    pass
-
+        # Try Start Menu shortcuts before Desktop files so real apps are found first.
         self._build_app_launch_index()
         normalized = normalized_request or self._normalize_app_name(app_name)
         matched_key = self._find_best_index_match(normalized, self.app_launch_index)
@@ -3290,6 +5392,21 @@ class WindowsAgent:
             except Exception:
                 self._audit("open_app", "error", {"target": start_key, "mode": "uwp", "app_id": app_id})
                 pass
+
+        # Open Desktop files/folders by natural name (e.g., "open Candidature") â€”
+        # last resort after all app sources are exhausted, so app names like "word"
+        # or "zoom" never accidentally open a same-named Desktop file instead of the app.
+        if not prefer_app_resolution:
+            desktop_item = self._find_desktop_item_path(app_name)
+            if desktop_item:
+                try:
+                    os.startfile(desktop_item)
+                    self._audit("open_app", "allowed", {"target": desktop_item, "mode": "desktop_item"})
+                    return f"Opened {os.path.basename(desktop_item)}"
+                except Exception:
+                    self._audit("open_app", "error", {"target": desktop_item, "mode": "desktop_item"})
+                    pass
+
         self._audit("open_app", "blocked", {"target": app_name, "reason": "not_in_allowlist_or_not_found"})
         return None
 
@@ -3338,7 +5455,7 @@ class WindowsAgent:
                     continue
                 if name.lower() == query_stripped.lower():
                     return os.path.join(self.desktop_root, name)
-            # No exact match found â don't fall back to fuzzy for explicit filenames
+            # No exact match found Ã¢Â€Â” don't fall back to fuzzy for explicit filenames
             return None
 
         lookup = {}
@@ -3351,7 +5468,7 @@ class WindowsAgent:
             if key and key not in lookup:
                 lookup[key] = os.path.join(self.desktop_root, name)
 
-        match_key = self._find_best_index_match(normalized_query, lookup)
+        match_key = self._find_best_index_match(normalized_query, lookup, strict=True)
         if match_key:
             return lookup.get(match_key)
         return None
@@ -3486,7 +5603,7 @@ class WindowsAgent:
             return f"I couldn't read the page at {url}. It may be blocked or unavailable."
 
         if not question:
-            # No question â just return a clean summary
+            # No question Ã¢Â€Â” just return a clean summary
             now = datetime.now().strftime("%Y-%m-%d")
             msgs = [
                 {
@@ -3515,7 +5632,7 @@ class WindowsAgent:
                         f"You are Opuntia, a smart assistant. Today is {now}.\n\n"
                         "The user shared a web page and has a question about it. Answer using only the page content.\n\n"
                         "## Answer format\n"
-                        "- **Direct answer first** â key fact or result, no preamble.\n"
+                        "- **Direct answer first** Ã¢Â€Â” key fact or result, no preamble.\n"
                         "- Scale depth: simple question ? 1-3 sentences; complex ? ## sections + bullet points.\n"
                         "- **Bold** key names, numbers, facts. Bullet points for 3+ items. Table for comparisons.\n"
                         "- If the answer is not on the page, say so clearly.\n"
@@ -3658,18 +5775,1039 @@ class WindowsAgent:
             paths.append(m.strip().strip(".,;!?)"))
         return paths
 
+    # ── Default browser detection ─────────────────────────────────────────────
+    def _pw_detect_default_browser(self):
+        """
+        Returns (pw_engine, channel, user_data_dir) for the Windows default browser.
+        pw_engine: 'chromium' | 'firefox'
+        channel:   'chrome' | 'msedge' | 'chromium' | None  (None = use playwright's bundled)
+        user_data_dir: path to real browser profile so saved data is available
+        """
+        channel = None
+        pw_engine = "chromium"
+        user_data_dir = None
+
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice"
+            )
+            prog_id = winreg.QueryValueEx(key, "ProgId")[0].lower()
+            winreg.CloseKey(key)
+
+            _home = os.path.expanduser("~")
+            if "chrome" in prog_id:
+                channel = "chrome"
+                pw_engine = "chromium"
+                user_data_dir = os.path.join(_home, "AppData", "Local", "Google", "Chrome", "User Data")
+            elif "msedge" in prog_id or "edge" in prog_id:
+                channel = "msedge"
+                pw_engine = "chromium"
+                user_data_dir = os.path.join(_home, "AppData", "Local", "Microsoft", "Edge", "User Data")
+            elif "brave" in prog_id:
+                channel = "chrome"  # Brave uses Chromium channel
+                pw_engine = "chromium"
+                user_data_dir = os.path.join(_home, "AppData", "Local", "BraveSoftware", "Brave-Browser", "User Data")
+            elif "firefox" in prog_id:
+                pw_engine = "firefox"
+                channel = None
+                # Firefox profiles are in a random folder — find the default one
+                ff_profiles = os.path.join(_home, "AppData", "Roaming", "Mozilla", "Firefox", "Profiles")
+                if os.path.isdir(ff_profiles):
+                    for p in os.listdir(ff_profiles):
+                        if p.endswith(".default-release") or p.endswith(".default"):
+                            user_data_dir = os.path.join(ff_profiles, p)
+                            break
+            elif "opera" in prog_id:
+                channel = None
+                pw_engine = "chromium"
+                user_data_dir = os.path.join(_home, "AppData", "Roaming", "Opera Software", "Opera Stable")
+        except Exception:
+            pass
+
+        return pw_engine, channel, user_data_dir
+
+    # ── Persistent Playwright session (thread-safe, queue-based) ─────────────
+    def _pw_ensure_thread(self):
+        """Start the Playwright worker thread if not running."""
+        import queue, threading
+        if self._pw_cmd_queue is None:
+            self._pw_cmd_queue = queue.Queue()
+            self._pw_res_queue = queue.Queue()
+        if self._pw_thread is None or not self._pw_thread.is_alive():
+            self._pw_thread = threading.Thread(
+                target=self._pw_worker_loop,
+                args=(self._pw_cmd_queue, self._pw_res_queue),
+                daemon=True,
+            )
+            self._pw_thread.start()
+
+    def _pw_find_browser_exe(self, channel):
+        """Find the browser executable path for the given channel."""
+        import winreg
+        candidates = []
+        if channel == "chrome":
+            candidates = [
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                os.path.join(os.path.expanduser("~"), r"AppData\Local\Google\Chrome\Application\chrome.exe"),
+            ]
+        elif channel == "msedge":
+            candidates = [
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+                r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            ]
+        elif channel == "brave":
+            candidates = [
+                r"C:\Program Files\BraveSoftware\Brave-Browser\Application\brave.exe",
+                os.path.join(os.path.expanduser("~"), r"AppData\Local\BraveSoftware\Brave-Browser\Application\brave.exe"),
+            ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
+
+    def _pw_worker_loop(self, cmd_q, res_q):
+        """Runs on the Playwright thread. Owns the browser for its lifetime."""
+        if sync_playwright is None:
+            return
+        try:
+            with sync_playwright() as pw:
+                engine_name = getattr(self, "_pw_browser_type", "chromium")
+                engine = {"chromium": pw.chromium, "firefox": pw.firefox, "webkit": pw.webkit}.get(engine_name, pw.chromium)
+                browser = engine.launch(
+                    headless=False,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                context = browser.new_context(
+                    viewport={"width": 1280, "height": 800},
+                    bypass_csp=True,
+                    ignore_https_errors=True,
+                )
+                # Block heavy non-essential resources for faster page loads
+                context.route(
+                    "**/*.{png,jpg,jpeg,gif,webp,svg,woff,woff2,ttf,eot}",
+                    lambda route, _: route.abort()
+                    if route.request.resource_type in ("image", "font")
+                    else route.continue_(),
+                )
+                page = context.new_page()
+                page.set_default_timeout(4000)
+                page.set_default_navigation_timeout(25000)
+
+                self._pw_page = page
+                while True:
+                    try:
+                        cmd, args, kwargs = cmd_q.get(timeout=300)
+                    except Exception:
+                        break
+                    if cmd == "__close__":
+                        break
+                    try:
+                        result = self._pw_exec(page, browser, context, cmd, args, kwargs)
+                    except Exception as e:
+                        result = f"Browser error: {e}"
+                    res_q.put(result)
+
+                try:
+                    context.close()
+                    browser.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            res_q.put(f"Playwright failed to start: {e}")
+        finally:
+            self._pw_page = None
+            self._pw_cmd_queue = None
+            self._pw_res_queue = None
+            self._pw_thread = None
+
+    def _pw_send(self, cmd, *args, _timeout=12, **kwargs):
+        """Send a command to the Playwright thread and wait for the result."""
+        self._pw_ensure_thread()
+        self._pw_cmd_queue.put((cmd, args, kwargs))
+        try:
+            return self._pw_res_queue.get(timeout=_timeout)
+        except Exception:
+            return "Browser command timed out."
+
+    def _pw_exec(self, page, browser, context, cmd, args, kwargs):
+        """Execute a Playwright command on the worker thread."""
+        import json as _json, re as _re, os as _os
+
+        # ── Element finder — scores every element by how well it matches the target string ──
+        # Checks text, aria-label, title, placeholder, alt, data-testid, id, class, name, value
+        # Prioritises interactive elements. Returns best match or null.
+        _JS_FIND_AND_CLICK = """
+        ([target, action]) => {
+            const t = (target||'').toLowerCase().trim();
+            function score(el) {
+                if (!el) return -1;
+                const r = el.getBoundingClientRect();
+                if (r.width===0 && r.height===0) return -1;
+                const checks = [
+                    el.innerText, el.textContent,
+                    el.getAttribute('aria-label'), el.ariaLabel, el.title,
+                    el.getAttribute('placeholder'), el.getAttribute('alt'),
+                    el.getAttribute('data-testid'), el.getAttribute('name'),
+                    el.value, el.getAttribute('data-tooltip'), el.id,
+                    el.getAttribute('data-cy'), el.getAttribute('data-label'),
+                ];
+                for (const v of checks) {
+                    if (!v) continue;
+                    const vl = String(v).trim().toLowerCase();
+                    if (vl === t)           return 3000 - vl.length;
+                    if (vl.startsWith(t))   return 2000 - vl.length;
+                    if (vl.includes(t))     return 1000 - vl.length;
+                }
+                return -1;
+            }
+            const SELECTORS = [
+                'button','a','input','select','textarea',
+                'input[type="submit"]','input[type="button"]','input[type="search"]','input[type="image"]',
+                '[role="button"]','[role="link"]','[role="tab"]','[role="menuitem"]',
+                '[role="option"]','[role="searchbox"]','[role="combobox"]','[role="checkbox"]',
+                '[role="radio"]','[role="switch"]','[role="textbox"]','[role="slider"]',
+                'label','[class*="btn"]','[class*="button"]','[class*="icon"]',
+                'nav a','header button','header a','[class*="menu"]',
+                'span','li','p','div','h1','h2','h3','h4','img','svg','i','em',
+            ];
+            let bestEl = null, bestScore = -1;
+            const seen = new WeakSet();
+            for (const sel of SELECTORS) {
+                try {
+                    for (const el of document.querySelectorAll(sel)) {
+                        if (seen.has(el)) continue; seen.add(el);
+                        const s = score(el);
+                        if (s > bestScore) { bestScore = s; bestEl = el; }
+                    }
+                } catch(e) {}
+            }
+            if (!bestEl || bestScore < 0) return null;
+            bestEl.scrollIntoView({block:'nearest', behavior:'instant'});
+            bestEl.focus();
+            if (action === 'dblclick') {
+                bestEl.dispatchEvent(new MouseEvent('dblclick',{bubbles:true,cancelable:true}));
+            } else if (action === 'rightclick') {
+                bestEl.dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true,button:2}));
+            } else {
+                bestEl.dispatchEvent(new MouseEvent('mouseover',{bubbles:true}));
+                bestEl.dispatchEvent(new MouseEvent('mousedown',{bubbles:true,cancelable:true}));
+                bestEl.dispatchEvent(new MouseEvent('mouseup',  {bubbles:true,cancelable:true}));
+                bestEl.click();
+                bestEl.dispatchEvent(new MouseEvent('click',    {bubbles:true,cancelable:true}));
+            }
+            return (bestEl.innerText||bestEl.getAttribute('aria-label')||bestEl.title||target||'').trim().slice(0,80);
+        }
+        """
+
+        _JS_SCROLL = """
+        (dy) => {
+            function canScroll(el) {
+                const s = window.getComputedStyle(el);
+                return (s.overflow+s.overflowY).match(/auto|scroll/) && el.scrollHeight > el.clientHeight + 4;
+            }
+            let el = document.activeElement;
+            while (el && el !== document.body && el !== document.documentElement) {
+                if (canScroll(el)) { el.scrollBy({top:dy,behavior:'instant'}); return; }
+                el = el.parentElement;
+            }
+            let best=null, bestH=0;
+            for (const c of document.querySelectorAll('main,article,[class*="feed"],[class*="scroll"],[class*="content"],[class*="list"],*')) {
+                if (c.clientHeight>150 && canScroll(c) && c.clientHeight>bestH) { best=c; bestH=c.clientHeight; }
+            }
+            if (best) { best.scrollBy({top:dy,behavior:'instant'}); }
+            else { window.scrollBy({top:dy,behavior:'instant'}); }
+        }
+        """
+
+        _JS_FILL_INPUT = """
+        ([fieldHint, text]) => {
+            const t = (fieldHint||'').toLowerCase().trim();
+            const vis = el => { const r=el.getBoundingClientRect(); return r.width>0&&r.height>0; };
+            let best=null, bestScore=-1;
+            for (const el of document.querySelectorAll('input:not([type="hidden"]):not([type="submit"]):not([type="button"]),textarea,[contenteditable="true"],[role="textbox"],[role="searchbox"],[role="combobox"]')) {
+                if (!vis(el)) continue;
+                const checks = [el.getAttribute('placeholder'),el.getAttribute('aria-label'),el.name,el.id,el.getAttribute('data-testid')];
+                let s=-1;
+                for (const v of checks) {
+                    if (!v) continue;
+                    const vl=v.toLowerCase();
+                    if (vl===t) {s=3000; break;}
+                    if (vl.startsWith(t)) {s=Math.max(s,2000); }
+                    if (vl.includes(t))   {s=Math.max(s,1000); }
+                }
+                if (s<0 && t==='') s=500;  // empty hint = first visible input
+                if (s>bestScore) {bestScore=s; best=el;}
+            }
+            if (!best) return false;
+            best.scrollIntoView({block:'nearest',behavior:'instant'});
+            best.focus();
+            best.select && best.select();
+            // Native value setter to bypass React/Vue controlled inputs
+            const nativeSetter = Object.getOwnPropertyDescriptor(best.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:HTMLInputElement.prototype, 'value');
+            if (nativeSetter && nativeSetter.set) nativeSetter.set.call(best, text);
+            else best.value = text;
+            best.dispatchEvent(new Event('input',{bubbles:true}));
+            best.dispatchEvent(new Event('change',{bubbles:true}));
+            best.dispatchEvent(new KeyboardEvent('keyup',{bubbles:true}));
+            return true;
+        }
+        """
+
+        _JS_SCAN = """
+        () => {
+            const vis = el => { const r=el.getBoundingClientRect(); return r.width>0&&r.height>0&&r.top<window.innerHeight+200; };
+            const result = {title:document.title, url:location.href, buttons:[], links:[], inputs:[], headings:[], text:''};
+            const bSet=new Set();
+            for (const b of document.querySelectorAll('button,[role="button"],[role="tab"],[role="menuitem"],[role="option"]')) {
+                if (!vis(b)) continue;
+                const label=(b.innerText||b.getAttribute('aria-label')||b.title||'').trim().slice(0,60);
+                if (label&&!bSet.has(label)) { bSet.add(label); result.buttons.push(label); }
+            }
+            for (const a of document.querySelectorAll('a[href]')) {
+                if (!vis(a)) continue;
+                const txt=(a.innerText||a.title||a.getAttribute('aria-label')||'').trim().slice(0,60);
+                if (txt) result.links.push(txt);
+            }
+            for (const i of document.querySelectorAll('input:not([type="hidden"]),select,textarea,[role="textbox"],[role="searchbox"]')) {
+                if (!vis(i)) continue;
+                result.inputs.push((i.getAttribute('placeholder')||i.getAttribute('aria-label')||i.name||i.type||'field').slice(0,40));
+            }
+            for (const h of document.querySelectorAll('h1,h2,h3,h4')) {
+                if (vis(h)) result.headings.push(h.innerText.trim().slice(0,80));
+            }
+            result.text = (document.body&&document.body.innerText||'').replace(/\\s+/g,' ').trim().slice(0,3000);
+            return result;
+        }
+        """
+
+        if cmd == "navigate":
+            url = args[0]
+            if not url.startswith("http"):
+                url = "https://" + url
+            try:
+                page.goto(url, wait_until="commit", timeout=25000)
+            except Exception:
+                try:
+                    page.goto(url, timeout=25000)
+                except Exception:
+                    pass
+            self._inject_opuntia_banner(page, f"Browsing · {url[:80]}")
+            return f"Opened **{url}** in browser."
+
+        if cmd == "click":
+            _t = args[0].strip()
+            try:
+                clicked = page.evaluate(_JS_FIND_AND_CLICK, [_t, "click"])
+                if clicked:
+                    return f"Clicked **{clicked}**."
+            except Exception:
+                pass
+            # Playwright fallback with aria-label, role, text
+            import re as _re2
+            _pat = _re2.compile(_re2.escape(_t), _re2.IGNORECASE)
+            for locator_fn in [
+                lambda: page.get_by_label(_pat).first,
+                lambda: page.get_by_role("button", name=_pat).first,
+                lambda: page.get_by_role("link", name=_pat).first,
+                lambda: page.get_by_role("tab", name=_pat).first,
+                lambda: page.get_by_placeholder(_pat).first,
+                lambda: page.get_by_text(_pat).first,
+                lambda: page.locator(f'[aria-label*="{_t}" i]').first,
+                lambda: page.locator(f'[title*="{_t}" i]').first,
+                lambda: page.locator(f'[data-testid*="{_t}" i]').first,
+            ]:
+                try:
+                    el = locator_fn()
+                    el.scroll_into_view_if_needed(timeout=500)
+                    el.click(timeout=1500, force=True)
+                    return f"Clicked **{_t}**."
+                except Exception:
+                    pass
+            return f"Could not find **{_t}** to click."
+
+        if cmd == "double_click":
+            _t = args[0].strip()
+            try:
+                clicked = page.evaluate(_JS_FIND_AND_CLICK, [_t, "dblclick"])
+                if clicked:
+                    return f"Double-clicked **{clicked}**."
+            except Exception:
+                pass
+            try:
+                page.get_by_text(_t).first.dblclick(timeout=1500)
+                return f"Double-clicked **{_t}**."
+            except Exception:
+                pass
+            return f"Could not double-click **{_t}**."
+
+        if cmd == "right_click":
+            _t = args[0].strip()
+            try:
+                clicked = page.evaluate(_JS_FIND_AND_CLICK, [_t, "rightclick"])
+                if clicked:
+                    return f"Right-clicked **{clicked}**."
+            except Exception:
+                pass
+            try:
+                page.get_by_text(_t).first.click(button="right", timeout=1500)
+                return f"Right-clicked **{_t}**."
+            except Exception:
+                pass
+            return f"Could not right-click **{_t}**."
+
+        if cmd == "hover":
+            _t = args[0].strip()
+            try:
+                page.evaluate(_JS_FIND_AND_CLICK, [_t, "hover"])
+            except Exception:
+                pass
+            try:
+                page.get_by_text(_t).first.hover(timeout=1500)
+                return f"Hovered over **{_t}**."
+            except Exception:
+                pass
+            try:
+                page.locator(f'[aria-label*="{_t}" i]').first.hover(timeout=1500)
+                return f"Hovered over **{_t}**."
+            except Exception:
+                pass
+            return f"Could not hover over **{_t}**."
+
+        if cmd == "drag":
+            src, dst = args[0].strip(), args[1].strip()
+            try:
+                src_loc = page.locator(f'text={src}').first
+                dst_loc = page.locator(f'text={dst}').first
+                src_loc.drag_to(dst_loc)
+                return f"Dragged **{src}** to **{dst}**."
+            except Exception as e:
+                return f"Drag failed: {e}"
+
+        if cmd == "type":
+            field, text = args[0], args[1]
+            try:
+                filled = page.evaluate(_JS_FILL_INPUT, [field, text])
+                if filled:
+                    return f"Typed into **{field}**."
+            except Exception:
+                pass
+            import re as _re2
+            _pat = _re2.compile(_re2.escape(field), _re2.IGNORECASE)
+            for attempt in [
+                lambda: page.get_by_placeholder(_pat).first.fill(text, timeout=1500),
+                lambda: page.get_by_label(_pat).first.fill(text, timeout=1500),
+                lambda: page.locator(field).first.fill(text, timeout=1500),
+            ]:
+                try:
+                    attempt()
+                    return f"Typed into **{field}**."
+                except Exception:
+                    pass
+            return f"Could not find field **{field}**."
+
+        if cmd == "keyboard_type":
+            page.keyboard.type(args[0], delay=0)
+            return f"Typed **{args[0]}**."
+
+        if cmd == "key_combo":
+            # e.g. "Control+a", "Control+c", "Alt+F4"
+            combo = args[0]
+            page.keyboard.press(combo)
+            return f"Pressed **{combo}**."
+
+        if cmd == "clear_input":
+            _t = args[0].strip() if args else ""
+            try:
+                filled = page.evaluate(_JS_FILL_INPUT, [_t, ""])
+                if filled:
+                    return f"Cleared **{_t}**."
+            except Exception:
+                pass
+            page.keyboard.press("Control+a")
+            page.keyboard.press("Delete")
+            return "Cleared input."
+
+        if cmd == "tab_next":
+            page.keyboard.press("Tab")
+            return "Moved to next field."
+
+        if cmd == "tab_prev":
+            page.keyboard.press("Shift+Tab")
+            return "Moved to previous field."
+
+        if cmd == "select":
+            field, option = args[0], args[1]
+            for attempt in [
+                lambda: page.locator(field).first.select_option(label=option, timeout=2000),
+                lambda: page.get_by_label(field).first.select_option(label=option, timeout=2000),
+            ]:
+                try:
+                    attempt()
+                    return f"Selected **{option}** in **{field}**."
+                except Exception:
+                    pass
+            return f"Could not select option: **{option}**"
+
+        if cmd == "search":
+            query = args[0]
+            # JS-first: fill most visible search input then press Enter
+            try:
+                found = page.evaluate(_JS_FILL_INPUT, ["search", query])
+                if not found:
+                    found = page.evaluate(_JS_FILL_INPUT, ["", query])  # first visible input
+                if found:
+                    page.keyboard.press("Enter")
+                    return f"Searched for **{query}**."
+            except Exception:
+                pass
+            for sel_fn in [
+                lambda: page.get_by_role("searchbox").first,
+                lambda: page.locator('input[type="search"]').first,
+                lambda: page.locator('input[name="q"]').first,
+            ]:
+                try:
+                    el = sel_fn()
+                    el.fill(query, timeout=1500)
+                    page.keyboard.press("Enter")
+                    return f"Searched for **{query}**."
+                except Exception:
+                    pass
+            return "Could not find a search box on this page."
+
+        if cmd == "scan_page":
+            try:
+                data = page.evaluate(_JS_SCAN)
+                parts = [f"**Page:** {data.get('title','')} — {data.get('url','')}"]
+                if data.get("headings"):
+                    parts.append("**Headings:** " + " · ".join(data["headings"][:8]))
+                if data.get("buttons"):
+                    parts.append("**Buttons/Tabs:** " + ", ".join(data["buttons"][:20]))
+                if data.get("links"):
+                    parts.append("**Links:** " + ", ".join(data["links"][:20]))
+                if data.get("inputs"):
+                    parts.append("**Inputs:** " + ", ".join(data["inputs"][:10]))
+                return "\n".join(parts)
+            except Exception as e:
+                return f"Scan failed: {e}"
+
+        if cmd == "wait_for":
+            target = args[0].strip()
+            timeout_ms = int(args[1]) if len(args) > 1 else 5000
+            try:
+                import re as _re2
+                page.get_by_text(_re2.compile(_re2.escape(target), _re2.IGNORECASE)).first.wait_for(timeout=timeout_ms)
+                return f"Found **{target}** on page."
+            except Exception:
+                pass
+            try:
+                page.locator(target).first.wait_for(timeout=timeout_ms)
+                return f"Element **{target}** appeared."
+            except Exception:
+                return f"**{target}** did not appear within {timeout_ms//1000}s."
+
+        if cmd == "wait_for_nav":
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=10000)
+                return "Page loaded."
+            except Exception:
+                return "Page load timed out."
+
+        if cmd == "refresh":
+            page.reload(wait_until="commit", timeout=15000)
+            return "Page refreshed."
+
+        if cmd == "copy_text":
+            # Copy selected text via keyboard
+            page.keyboard.press("Control+c")
+            return "Copied selection to clipboard."
+
+        if cmd == "select_all":
+            page.keyboard.press("Control+a")
+            return "Selected all."
+
+        if cmd == "scroll":
+            direction, amount = args[0], args[1]
+            dy = amount if direction == "down" else -amount
+            page.evaluate(_JS_SCROLL, dy)
+            return f"Scrolled {direction}."
+
+        if cmd == "scroll_to":
+            where = args[0]
+            if where == "top":
+                page.evaluate("""
+                    () => {
+                        window.scrollTo({top:0,behavior:'instant'});
+                        for (const el of document.querySelectorAll('*')) {
+                            if (el.scrollTop > 0) el.scrollTo({top:0,behavior:'instant'});
+                        }
+                    }
+                """)
+            else:
+                page.evaluate("""
+                    () => {
+                        window.scrollTo({top:document.body.scrollHeight,behavior:'instant'});
+                        for (const el of document.querySelectorAll('*')) {
+                            if (el.scrollHeight > el.clientHeight + 4) {
+                                el.scrollTo({top:el.scrollHeight,behavior:'instant'});
+                            }
+                        }
+                    }
+                """)
+            return f"Scrolled to {where}."
+
+        if cmd == "read_page":
+            try:
+                data = page.evaluate(_JS_SCAN)
+                text = (data.get("text") or "").strip()
+                import re as _re2
+                text = _re2.sub(r'\n{3,}', '\n\n', text)
+                return text[:4000]
+            except Exception:
+                pass
+            return self._strip_html_tags(page.content())[:4000]
+
+        if cmd == "screenshot":
+            fname = args[0] if args else "opuntia_screenshot.png"
+            if not fname.endswith(".png"):
+                fname += ".png"
+            path = _os.path.join(_os.path.expanduser("~"), "Desktop", fname)
+            fullpage = kwargs.get("fullpage", False)
+            page.screenshot(path=path, full_page=fullpage)
+            label = "Full-page screenshot" if fullpage else "Screenshot"
+            return f"{label} saved to Desktop as **{fname}**."
+
+        if cmd == "screenshot_element":
+            selector, fname = args[0], args[1] if len(args) > 1 else "opuntia_element.png"
+            if not fname.endswith(".png"):
+                fname += ".png"
+            path = _os.path.join(_os.path.expanduser("~"), "Desktop", fname)
+            try:
+                page.locator(selector).first.screenshot(path=path)
+                return f"Element screenshot saved to Desktop as **{fname}**."
+            except Exception as e:
+                return f"Could not capture element: {e}"
+
+        if cmd == "record_video_start":
+            import tempfile as _tf
+            vdir = _tf.mkdtemp(prefix="opuntia_vid_")
+            try:
+                new_ctx = browser.new_context(record_video_dir=vdir)
+                new_page = new_ctx.new_page()
+                try:
+                    cur_url = page.url
+                    if cur_url and cur_url != "about:blank":
+                        new_page.goto(cur_url, wait_until="commit", timeout=15000)
+                except Exception:
+                    pass
+                self._pw_page = new_page
+                self._pw_video_context = new_ctx
+                self._pw_video_page = new_page
+                return "Video recording started. Say **stop recording** when done."
+            except Exception as e:
+                return f"Could not start recording: {e}"
+
+        if cmd == "record_video_stop":
+            try:
+                vpage = getattr(self, "_pw_video_page", None)
+                vctx = getattr(self, "_pw_video_context", None)
+                if vpage is None:
+                    return "No recording in progress."
+                video_path = vpage.video.path() if vpage.video else None
+                vpage.close()
+                if vctx:
+                    vctx.close()
+                self._pw_video_page = None
+                self._pw_video_context = None
+                if video_path:
+                    dst = _os.path.join(_os.path.expanduser("~"), "Desktop", "opuntia_recording.webm")
+                    import shutil as _sh
+                    _sh.move(video_path, dst)
+                    return "Recording saved to Desktop as **opuntia_recording.webm**."
+                return "Recording stopped."
+            except Exception as e:
+                return f"Could not stop recording: {e}"
+
+        if cmd == "intercept_start":
+            self._pw_intercepted = []
+            def _handle(route, request):
+                self._pw_intercepted.append({
+                    "method": request.method,
+                    "url": request.url,
+                    "resource": request.resource_type,
+                })
+                route.continue_()
+            context.route("**/*", _handle)
+            return "Network interception started. Say **show intercepted requests** when ready."
+
+        if cmd == "intercept_stop":
+            try:
+                context.unroute("**/*")
+            except Exception:
+                pass
+            captured = getattr(self, "_pw_intercepted", [])
+            if not captured:
+                return "No requests were captured."
+            lines = [f"- `{r['method']}` {r['resource']} — {r['url'][:120]}" for r in captured[:40]]
+            self._pw_intercepted = []
+            return f"**Captured {len(captured)} requests:**\n" + "\n".join(lines)
+
+        if cmd == "run_js":
+            code = args[0]
+            try:
+                result = page.evaluate(code)
+                return f"**JS result:** `{result}`"
+            except Exception as e:
+                return f"JS error: {e}"
+
+        if cmd == "press_key":
+            page.keyboard.press(args[0])
+            return f"Pressed **{args[0]}**."
+
+        if cmd == "go_back":
+            page.go_back(wait_until="commit", timeout=10000)
+            return "Went back."
+
+        if cmd == "go_forward":
+            page.go_forward(wait_until="commit", timeout=10000)
+            return "Went forward."
+
+        if cmd == "new_tab":
+            context.new_page()
+            return "Opened new tab."
+
+        if cmd == "get_title":
+            return f"Page title: **{page.title()}**"
+
+        if cmd == "get_url":
+            return f"Current URL: `{page.url}`"
+
+        if cmd == "full_context":
+            # Single round-trip: returns dict with url, title, page text, and scan.
+            # Used by the LLM intelligence block to avoid 4 separate queue calls.
+            try:
+                _data = page.evaluate(_JS_SCAN)
+                return {
+                    "url":   page.url or "",
+                    "title": page.title() or "",
+                    "text":  (_data.get("text") or "")[:4000],
+                    "scan":  str(_data)[:2000],
+                }
+            except Exception:
+                return {"url": page.url or "", "title": "", "text": "", "scan": ""}
+
+        return f"Unknown command: {cmd}"
+
+    def _pw_close_session(self):
+        if self._pw_cmd_queue:
+            self._pw_cmd_queue.put(("__close__", [], {}))
+        self._pw_page = None
+
+    def _pw_navigate(self, url):
+        return self._pw_send("navigate", url, _timeout=30)
+
+    def _pw_automate(self, user_input):
+        """Route natural language to Playwright commands. Returns reply or None."""
+        if sync_playwright is None:
+            return None
+        low = user_input.strip().lower()
+
+        # ── Switch browser engine ──────────────────────────────────────────
+        switch_m = re.search(r'\b(?:use|switch\s+to|open\s+(?:in|with)|launch)\s+(firefox|webkit|chromium|chrome)\b', low)
+        if switch_m:
+            engine = switch_m.group(1)
+            engine = "chromium" if engine == "chrome" else engine
+            if engine != getattr(self, "_pw_browser_type", "chromium"):
+                self._pw_browser_type = engine
+                self._pw_close_session()
+            return self._pw_send("navigate", "about:blank") if self._pw_page is None else f"Already on {engine}."
+
+        # ── Navigate ───────────────────────────────────────────────────────
+        nav_m = re.match(
+            r'^(?:play|open|browse|go\s+to|navigate\s+to|visit|load)\s+(https?://\S+|www\.\S+|\S+\.\w{2,})',
+            low,
+        )
+        if nav_m:
+            url = user_input.strip().split(None, 1)[1].strip()
+            self._pw_page_cache_ts = 0.0  # page will change — invalidate cache
+            return self._pw_send("navigate", url, _timeout=30)
+
+        # ── Click ──────────────────────────────────────────────────────────
+        click_m = re.match(r'^click\s+(?:on\s+)?(?:the\s+)?(.+)$', low)
+        if click_m:
+            return self._pw_send("click", click_m.group(1).strip(' "\''))
+
+        # ── Double-click ───────────────────────────────────────────────────
+        dbl_m = re.match(r'^(?:double[\s-]?click|dbl\s+click)\s+(?:on\s+)?(?:the\s+)?(.+)$', low)
+        if dbl_m:
+            return self._pw_send("double_click", dbl_m.group(1).strip(' "\''))
+
+        # ── Right-click ────────────────────────────────────────────────────
+        rc_m = re.match(r'^(?:right[\s-]?click|context\s+menu)\s+(?:on\s+)?(?:the\s+)?(.+)$', low)
+        if rc_m:
+            return self._pw_send("right_click", rc_m.group(1).strip(' "\''))
+
+        # ── Hover ──────────────────────────────────────────────────────────
+        hover_m = re.match(r'^hover\s+(?:over\s+)?(?:on\s+)?(?:the\s+)?(.+)$', low)
+        if hover_m:
+            return self._pw_send("hover", hover_m.group(1).strip(' "\''))
+
+        # ── Drag ───────────────────────────────────────────────────────────
+        drag_m = re.match(r'^drag\s+(?:the\s+)?["\']?(.+?)["\']?\s+(?:to|onto|into)\s+(?:the\s+)?["\']?(.+?)["\']?$', low)
+        if drag_m:
+            return self._pw_send("drag", drag_m.group(1).strip(' "\''), drag_m.group(2).strip(' "\''))
+
+        # ── Type into field ────────────────────────────────────────────────
+        type_m = re.match(r'^(?:type|write|enter|input|fill)\s+["\']?(.+?)["\']?\s+(?:in(?:to)?|on|inside)\s+(?:the\s+)?(.+)$', low)
+        if type_m:
+            return self._pw_send("type", type_m.group(2).strip(' "\''), type_m.group(1).strip(' "\''))
+
+        # ── Type bare (type/write/enter without a target field) ───────────
+        type_bare = re.match(r'^(?:type|enter|write)\s+["\']?(.+?)["\']?$', low)
+        if type_bare:
+            return self._pw_send("keyboard_type", type_bare.group(1))
+
+        # ── Keyboard shortcuts ─────────────────────────────────────────────
+        # "press ctrl a" / "ctrl+c" / "select all" / "copy" / "paste" / "undo"
+        if re.match(r'^(?:select\s+all|ctrl\s*\+?\s*a)\s*$', low):
+            return self._pw_send("key_combo", "Control+a")
+        if re.match(r'^(?:copy|ctrl\s*\+?\s*c)\s*$', low):
+            return self._pw_send("key_combo", "Control+c")
+        if re.match(r'^(?:paste|ctrl\s*\+?\s*v)\s*$', low):
+            return self._pw_send("key_combo", "Control+v")
+        if re.match(r'^(?:undo|ctrl\s*\+?\s*z)\s*$', low):
+            return self._pw_send("key_combo", "Control+z")
+        if re.match(r'^(?:redo|ctrl\s*\+?\s*y)\s*$', low):
+            return self._pw_send("key_combo", "Control+y")
+        if re.match(r'^(?:save|ctrl\s*\+?\s*s)\s*$', low):
+            return self._pw_send("key_combo", "Control+s")
+        if re.match(r'^(?:find|ctrl\s*\+?\s*f)\s*$', low):
+            return self._pw_send("key_combo", "Control+f")
+        if re.match(r'^(?:refresh|reload|f5)\s*$', low):
+            return self._pw_send("refresh")
+        # Generic "press ctrl+X" or "press alt+F4" etc
+        combo_m = re.match(r'^press\s+((?:ctrl|alt|shift|meta|control)\s*[+\s]\s*\w+|\w+(?:\s*[+]\s*\w+)+)$', low)
+        if combo_m:
+            combo_raw = combo_m.group(1).strip()
+            combo_norm = re.sub(r'\s*\+\s*', '+', combo_raw).replace('ctrl','Control').replace('alt','Alt').replace('shift','Shift').replace('meta','Meta')
+            combo_norm = combo_norm.title().replace('Control','Control').replace('Alt','Alt')
+            return self._pw_send("key_combo", combo_norm)
+
+        # ── Tab navigation ─────────────────────────────────────────────────
+        if re.match(r'^(?:tab|next\s+field|press\s+tab)\s*$', low):
+            return self._pw_send("tab_next")
+        if re.match(r'^(?:shift\s+tab|previous\s+field|prev\s+field)\s*$', low):
+            return self._pw_send("tab_prev")
+
+        # ── Clear / reset input ────────────────────────────────────────────
+        clear_m = re.match(r'^(?:clear|reset|empty)\s+(?:the\s+)?(.+)$', low)
+        if clear_m:
+            return self._pw_send("clear_input", clear_m.group(1).strip(' "\''))
+
+        # ── Page scan — "what's on this page?" / "show me the buttons" ────
+        if re.search(r"what(?:'s| is)?\s+(?:on\s+)?(?:this|the)\s+page|scan\s+(?:the\s+)?page|list\s+(?:the\s+)?(?:buttons?|links?|elements?|fields?)|show\s+(?:me\s+)?(?:the\s+)?(?:buttons?|links?|elements?|menu)", low):
+            return self._pw_send("scan_page")
+
+        # ── Wait for element ───────────────────────────────────────────────
+        wait_m = re.match(r'^wait\s+(?:for\s+)?(?:the\s+)?["\']?(.+?)["\']?(?:\s+(\d+)s?)?\s*$', low)
+        if wait_m and not re.search(r'second|minute', low.split('wait')[-1]):
+            target_w = wait_m.group(1).strip(' "\'')
+            timeout_ms = int(wait_m.group(2)) * 1000 if wait_m.group(2) else 5000
+            return self._pw_send("wait_for", target_w, timeout_ms)
+
+        # ── Select dropdown ───────────────────────────────────────────────
+        select_m = re.match(r'^select\s+["\']?(.+?)["\']?\s+(?:from|in|on)\s+(?:the\s+)?(.+)$', low)
+        if select_m:
+            return self._pw_send("select", select_m.group(2).strip(' "\''), select_m.group(1).strip(' "\''))
+
+        # ── Search / focus search box ─────────────────────────────────────
+        # "search for X" → fill search box
+        search_m = re.match(r'^search\s+(?:for\s+)?["\']?(.+?)["\']?$', low)
+        if search_m:
+            return self._pw_send("search", search_m.group(1).strip(' "\''))
+        # "click search" / "open search" / "focus search" → just activate the search input
+        if re.match(r'^(?:click|open|tap|focus|activate|hit)\s+(?:the\s+)?search\b', low):
+            return self._pw_send("click", "search")
+
+        # ── Scroll ────────────────────────────────────────────────────────
+        if re.search(
+            r'scroll\s+(?:down\s+)?to\s+(?:the\s+)?bottom'
+            r'|scroll\s+all\s+the\s+way\s+down'
+            r'|go\s+to\s+(?:the\s+)?bottom'
+            r'|jump\s+to\s+(?:the\s+)?bottom'
+            r'|\bend\s+of\s+(?:the\s+)?page\b',
+            low
+        ):
+            return self._pw_send("scroll_to", "bottom")
+        if re.search(
+            r'scroll\s+(?:up\s+)?to\s+(?:the\s+)?top'
+            r'|scroll\s+all\s+the\s+way\s+up'
+            r'|back\s+to\s+top'
+            r'|go\s+to\s+(?:the\s+)?top'
+            r'|jump\s+to\s+(?:the\s+)?top'
+            r'|\btop\s+of\s+(?:the\s+)?page\b',
+            low
+        ):
+            return self._pw_send("scroll_to", "top")
+
+        def _scroll_amt(low):
+            num_m = re.search(r'(\d+)', low)
+            if num_m: return int(num_m.group(1))
+            if re.search(r'\b(more|further|lot|much|again|fast|big|large)\b', low): return 1200
+            return 600
+
+        if re.search(r'\bscroll\s+down\b|\bdown\s+(?:the\s+)?page\b|page\s+down\b', low):
+            return self._pw_send("scroll", "down", _scroll_amt(low))
+        if re.search(r'\bscroll\s+up\b|\bup\s+(?:the\s+)?page\b|page\s+up\b', low):
+            return self._pw_send("scroll", "up", _scroll_amt(low))
+        # Bare "down" / "up" when browser is active
+        if re.match(r'^down\s*$', low):
+            return self._pw_send("scroll", "down", 600)
+        if re.match(r'^up\s*$', low):
+            return self._pw_send("scroll", "up", 600)
+
+        # ── Screenshots ───────────────────────────────────────────────────
+        # Full-page screenshot
+        if re.search(r'full[\s-]?page\s+screenshot|screenshot\s+(?:of\s+)?(?:full|entire|whole)\s+page', low):
+            name_m = re.search(r'(?:save|name|as)\s+["\']?(\w[\w\s\-\.]+)["\']?', low)
+            fname = name_m.group(1).strip().replace(" ", "_") if name_m else "opuntia_fullpage.png"
+            return self._pw_send("screenshot", fname, fullpage=True)
+        # Element screenshot
+        elem_shot_m = re.match(r'(?:screenshot|capture|snap)\s+(?:of\s+)?(?:the\s+)?element\s+["\']?(.+?)["\']?(?:\s+(?:as|save\s+as)\s+["\']?(\S+)["\']?)?$', low)
+        if elem_shot_m:
+            sel = elem_shot_m.group(1).strip(' "\'')
+            fname = elem_shot_m.group(2) or "opuntia_element.png"
+            return self._pw_send("screenshot_element", sel, fname)
+        # Regular screenshot
+        if re.search(r'\bscreenshot\b|\bcapture\s+(?:the\s+)?(?:page|screen|browser)\b', low):
+            name_m = re.search(r'(?:save|name|as)\s+["\']?(\w[\w\s\-\.]+)["\']?', low)
+            fname = name_m.group(1).strip().replace(" ", "_") if name_m else "opuntia_screenshot.png"
+            return self._pw_send("screenshot", fname)
+
+        # ── Video recording ───────────────────────────────────────────────
+        if re.search(r'(?:start|begin)\s+(?:video\s+)?recording|record\s+(?:video|screen|this)', low):
+            return self._pw_send("record_video_start")
+        if re.search(r'stop\s+recording|save\s+(?:the\s+)?(?:video|recording)', low):
+            return self._pw_send("record_video_stop")
+
+        # ── Network interception ──────────────────────────────────────────
+        if re.search(r'intercept\s+(?:network\s+)?requests?|monitor\s+(?:network|requests?)|watch\s+(?:network|requests?)', low):
+            return self._pw_send("intercept_start")
+        if re.search(r'show\s+(?:intercepted|captured|network)\s+requests?|stop\s+intercept', low):
+            return self._pw_send("intercept_stop")
+
+        # ── JavaScript execution ──────────────────────────────────────────
+        js_m = re.match(r'^(?:run|execute|eval(?:uate)?)\s+(?:js|javascript|script)\s*[:\-]?\s*(.+)$', low, re.DOTALL)
+        if js_m:
+            code_raw = user_input.strip()
+            # Extract actual code from original casing
+            code_start = re.search(r'(?:run|execute|eval(?:uate)?)\s+(?:js|javascript|script)\s*[:\-]?\s*', code_raw, re.IGNORECASE)
+            code = code_raw[code_start.end():].strip().strip('`') if code_start else js_m.group(1)
+            return self._pw_send("run_js", code)
+
+        # ── Read page ─────────────────────────────────────────────────────
+        if re.match(r'^(?:read|extract|get|show)\s+(?:the\s+)?(?:page|content|text)', low):
+            text = self._pw_send("read_page")
+            return f"**Page content:**\n{text}"
+
+        # ── Page info ─────────────────────────────────────────────────────
+        if re.search(r"(?:what'?s?\s+(?:the\s+)?(?:page\s+)?title|get\s+(?:the\s+)?title)", low):
+            return self._pw_send("get_title")
+        if re.search(r"(?:what'?s?\s+(?:the\s+)?(?:current\s+)?url|get\s+(?:the\s+)?url|current\s+url)", low):
+            return self._pw_send("get_url")
+
+        # ── Press key ─────────────────────────────────────────────────────
+        key_m = re.match(r'^press\s+(?:the\s+)?(\w+)(?:\s+key)?$', low)
+        if key_m:
+            return self._pw_send("press_key", key_m.group(1).capitalize())
+
+        # ── Refresh ────────────────────────────────────────────────────────
+        if re.match(r'^(?:refresh|reload)\s*(?:the\s+)?(?:page)?\s*$', low):
+            return self._pw_send("refresh")
+
+        # ── Wait for page / element ────────────────────────────────────────
+        if re.match(r'^wait\s+(?:for\s+)?(?:the\s+)?(?:page\s+to\s+)?(?:load|finish)\s*$', low):
+            return self._pw_send("wait_for_nav")
+
+        # ── Navigation ────────────────────────────────────────────────────
+        if re.match(r'^go\s+back', low):
+            self._pw_page_cache_ts = 0.0
+            return self._pw_send("go_back")
+        if re.match(r'^go\s+forward', low):
+            self._pw_page_cache_ts = 0.0
+            return self._pw_send("go_forward")
+
+        # ── New tab ───────────────────────────────────────────────────────
+        if re.search(r'new\s+tab|open\s+(?:a\s+)?(?:new\s+)?tab', low):
+            return self._pw_send("new_tab")
+
+        # ── Close browser ─────────────────────────────────────────────────
+        if re.match(r'^(?:close|quit|stop)\s+(?:the\s+)?(?:browser|playwright|chromium|firefox|webkit)', low):
+            self._pw_close_session()
+            return "Browser closed."
+
+        return None
+
+    def _inject_opuntia_banner(self, page, action_label="Browsing"):
+        """Inject a floating Opuntia HUD banner into the Playwright page."""
+        import json as _json
+        label_js = _json.dumps(str(action_label))
+        try:
+            page.evaluate(f"""
+                (() => {{
+                    if (document.getElementById('__opuntia_hud__')) return;
+                    const actionLabel = {label_js};
+                    const hud = document.createElement('div');
+                    hud.id = '__opuntia_hud__';
+                    hud.style.cssText = [
+                        'position:fixed',
+                        'top:0','left:0','right:0',
+                        'z-index:2147483647',
+                        'background:linear-gradient(90deg,#0d0d0d 0%,#1a1a2e 100%)',
+                        'color:#ffffff',
+                        'font-family:system-ui,sans-serif',
+                        'font-size:13px',
+                        'font-weight:500',
+                        'padding:6px 16px',
+                        'display:flex',
+                        'align-items:center',
+                        'gap:10px',
+                        'border-bottom:1px solid rgba(120,180,255,0.25)',
+                        'box-shadow:0 2px 12px rgba(0,0,0,0.5)',
+                        'letter-spacing:0.01em',
+                    ].join(';');
+                    const shortUrl = window.location.hostname || window.location.href.slice(0,60);
+                    hud.innerHTML =
+                        '<span style="background:linear-gradient(135deg,#4f8ef7,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:700;font-size:14px;letter-spacing:0.04em;">⬡ OPUNTIA</span>' +
+                        '<span style="color:rgba(255,255,255,0.35);">|</span>' +
+                        '<span style="color:rgba(200,220,255,0.85);">' + actionLabel + '</span>' +
+                        '<span style="margin-left:auto;color:rgba(255,255,255,0.3);font-size:11px;">' + shortUrl + '</span>';
+                    document.body.prepend(hud);
+                    document.body.style.marginTop = (parseInt(document.body.style.marginTop||0) + 36) + 'px';
+                }})();
+            """)
+        except Exception:
+            pass
+
     def _fetch_with_playwright(self, url):
         """Fetch page content using Playwright (handles JavaScript)."""
         try:
             with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
+                browser = p.chromium.launch(headless=self.browser_headless)
                 page = browser.new_page()
                 page.goto(url, wait_until='networkidle', timeout=15000)
-                
+                self._inject_opuntia_banner(page, f"Reading · {url[:80]}")
+
                 # Get page content
                 html = page.content()
                 title = page.title()
-                
+
                 browser.close()
                 
                 if SOUP_AVAILABLE:
@@ -3788,7 +6926,7 @@ class WindowsAgent:
                 "content": (
                     "You are Opuntia, an intelligent research assistant.\n\n"
                     "## Answer structure (always follow this)\n"
-                    "1. **Direct answer first** â open with the key fact, date, or result. No preamble.\n"
+                    "1. **Direct answer first** Ã¢Â€Â” open with the key fact, date, or result. No preamble.\n"
                     "2. **Scale depth to the question:**\n"
                     "   - Simple fact ? 1-3 sentences with inline citations [1][2].\n"
                     "   - Technical/complex ? ## Overview + sections (explanation, examples, comparison table if useful, implications).\n"
@@ -3803,7 +6941,7 @@ class WindowsAgent:
                 "content": (
                     f"Research query: {query}\n\n"
                     f"Sources:\n{context}\n\n"
-                    "Answer directly â structured, with headings if the topic has multiple parts, bullet points for lists, and a comparison table if comparing options. Start with the direct answer."
+                    "Answer directly Ã¢Â€Â” structured, with headings if the topic has multiple parts, bullet points for lists, and a comparison table if comparing options. Start with the direct answer."
                 ),
             },
         ]
@@ -3812,7 +6950,7 @@ class WindowsAgent:
             # Append top 3 sources only
             top3 = contents[:3]
             if top3:
-                answer += "\n\n**Sources:** " + " Â· ".join(
+                answer += "\n\n**Sources:** " + " Ã‚Â· ".join(
                     f"[{i}] {src.get('url', '')}" for i, src in enumerate(top3, 1)
                 )
             return answer
@@ -3820,7 +6958,7 @@ class WindowsAgent:
             # Fallback to plain listing
             lines = [f"**Research: {query}**\n"]
             for i, src in enumerate(contents, 1):
-                lines.append(f"**[{i}] {src['title']}** â {src['url']}")
+                lines.append(f"**[{i}] {src['title']}** Ã¢Â€Â” {src['url']}")
                 lines.append(src['content'][:500])
                 lines.append("")
             return "\n".join(lines)
@@ -3845,7 +6983,7 @@ class WindowsAgent:
                     result_anchors = soup.find_all('a', class_='result__a')[:num_results]
                     for anchor in result_anchors:
                         href = anchor.get('href', '')
-                        # DDG wraps redirect URLs â extract the real URL
+                        # DDG wraps redirect URLs Ã¢Â€Â” extract the real URL
                         if href.startswith('//duckduckgo.com/l/?') or 'uddg=' in href:
                             from urllib.parse import parse_qs, urlparse
                             try:
@@ -4150,7 +7288,7 @@ class WindowsAgent:
             return []
 
     def _search_brave_api_results(self, query, limit=5):
-        """Brave Search API â free tier: 2000 req/month. Set BRAVE_SEARCH_API_KEY in .env"""
+        """Brave Search API Ã¢Â€Â” free tier: 2000 req/month. Set BRAVE_SEARCH_API_KEY in .env"""
         if not self.brave_search_api_key:
             return []
         q = (query or "").strip()
@@ -4188,7 +7326,7 @@ class WindowsAgent:
             return []
 
     def _search_tavily_results(self, query, limit=5):
-        """Tavily Search API â designed for AI agents. Free tier: 1000 req/month. Set TAVILY_API_KEY in .env"""
+        """Tavily Search API Ã¢Â€Â” designed for AI agents. Free tier: 1000 req/month. Set TAVILY_API_KEY in .env"""
         if not self.tavily_api_key:
             return []
         q = (query or "").strip()
@@ -4284,11 +7422,11 @@ class WindowsAgent:
             if not re.search(r"\b(202[0-9]|203[0-9])\b", low):
                 q += f" {current_year}"
 
-        # "Who won / who is champion" â tell the engine we want the winner/result.
+        # "Who won / who is champion" Ã¢Â€Â” tell the engine we want the winner/result.
         if re.search(r"\b(who\s+won|who\s+is\s+the\s+champion|last\s+winner|current\s+champion)\b", low):
             q += " winner result"
 
-        # Person queries â add full name context cues.
+        # Person queries Ã¢Â€Â” add full name context cues.
         if re.search(r"\b(ceo|president|prime minister|manager|coach|director)\b", low):
             q += " current"
 
@@ -4458,9 +7596,10 @@ class WindowsAgent:
             origin = f"{parsed.scheme}://{parsed.netloc}"
             now = time.time()
             cached = self._robots_cache.get(origin)
+            parser = None
             if cached and (now - cached.get("ts", 0) <= max(60, int(self.robots_cache_ttl_sec))):
                 parser = cached.get("parser")
-            else:
+            if parser is None:
                 robots_url = f"{origin}/robots.txt"
                 parser = robotparser.RobotFileParser()
                 parser.set_url(robots_url)
@@ -4483,9 +7622,10 @@ class WindowsAgent:
         if self.web_use_playwright and sync_playwright is not None and self.web_search_timeout_sec >= 8:
             try:
                 with sync_playwright() as pw:
-                    browser = pw.chromium.launch(headless=True)
+                    browser = pw.chromium.launch(headless=self.browser_headless)
                     page = browser.new_page()
                     page.goto(url, wait_until="domcontentloaded", timeout=9000)
+                    self._inject_opuntia_banner(page, f"Reading · {url[:80]}")
                     html_body = page.content() or ""
                     browser.close()
                 text = self._strip_html_tags(html_body)
@@ -4508,7 +7648,7 @@ class WindowsAgent:
         if not t:
             return False
 
-        # File/document creation — never needs live web research
+        # File/document creation â€” never needs live web research
         _doc_block = [
             r"\b(pdf|\.pdf|docx?|\.docx?|word\s+doc)\b",
             r"^(create|make|write|save|generate|build)\b.{0,60}\b(pdf|doc|word|folder|file)\b",
@@ -4581,6 +7721,12 @@ class WindowsAgent:
         t = (cmd_lower or "").strip().lower()
         if not t:
             return False
+        if re.search(
+            r"\b(explain|clarify|what\s+(did|have)\s+you\s+(write|say|send)|what\s+you\s+(wrote|said|sent)|previous\s+(answer|reply|response)|last\s+(answer|reply|response))\b",
+            t,
+            re.IGNORECASE,
+        ):
+            return False
         if self._is_smalltalk_query(t):
             return False
         # Avoid hijacking normal conversation into web research unless explicitly web-like.
@@ -4611,7 +7757,7 @@ class WindowsAgent:
             r"\b(file|folder|desktop items|running apps|app status|settings)\b",
             r"\b(salat|salah|prayer)\b",
             r"\b(crypto|bitcoin|btc|ethereum|eth)\b",
-            # File/document creation — always handled by local handlers, never web search
+            # File/document creation â€” always handled by local handlers, never web search
             r"\b(pdf|\.pdf|docx?|\.docx?|word\s+doc)\b",
             r"^(create|make|write|save|generate|build)\b.{0,60}\b(pdf|doc|word|folder|file)\b",
             r"\b(?:write|create)\s+what\s+(?:(?:you|u)|(?:have|had)\s+(?:you|u))\b",
@@ -4653,7 +7799,7 @@ class WindowsAgent:
             r"\b(internet|online)\s+status\b",
             r"\b(date|today'?s date|what(?:'s| is)\s+the\s+date)\b",
             r"\b(time|what(?:'s| is)\s+the\s+time)\b",
-            # File/document creation — always handled locally, never via web search
+            # File/document creation â€” always handled locally, never via web search
             r"\b(pdf|\.pdf|docx?|\.docx?|word\s+doc)\b",
             r"^(create|make|write|save|generate|build)\b.{0,60}\b(pdf|doc|word|folder|file)\b",
             r"\b(?:write|create)\s+what\s+(?:(?:you|u)|(?:have|had)\s+(?:you|u))\b",
@@ -4663,7 +7809,7 @@ class WindowsAgent:
         ]
         if any(re.search(p, t, flags=re.IGNORECASE) for p in blocked):
             return False
-        # Always search when comparing tools/products/AI assistants — the other
+        # Always search when comparing tools/products/AI assistants â€” the other
         # tool may be unknown to the model and must be looked up.
         if re.search(r'\b(difference|compare|comparison|vs\.?|versus|between)\b', t):
             topic = self._extract_research_topic(user_input)
@@ -4685,49 +7831,62 @@ class WindowsAgent:
 
     def _get_followup_context(self, user_input):
         """
-        Detect if the current query is a short metric/data follow-up to the last
-        conversation topic. If so, return a strong context-injection string so the
-        LLM (or web search router) doesn't treat it as a standalone question.
-        Returns '' if not a follow-up.
+        Detect whether the current message depends on previous context.
+        Returns a system-hint string, or "" when it looks standalone.
         """
-        q = (user_input or '').strip()
+        q = (user_input or "").strip()
         words = q.split()
-        # Long queries are self-contained
-        if len(words) > 14:
-            return ''
-        # Must contain a data/metric/elaboration keyword
-        if not re.search(
-            r'\b(numbers?|data|statistics?|stats?|more|details?|info(?:rmation)?|'
-            r'examples?|specific|exact|precise|figures?|percentages?|breakdown|'
-            r'deeper|elaborate|expand|latest|recent|current|update)\b',
+        if len(words) > 18:
+            return ""
+        _has_data_kw = bool(re.search(
+            r"\b(numbers?|data|statistics?|stats?|more|details?|info(?:rmation)?|"
+            r"examples?|specific|exact|precise|figures?|percentages?|breakdown|"
+            r"deeper|elaborate|expand|latest|recent|current|update)\b",
             q, re.IGNORECASE,
-        ):
-            return ''
-        # If the query already names its own topic (has a long noun phrase or URL) skip
-        if re.search(r'https?://', q):
-            return ''
-        # Get recent history (mode-aware)
-        hist = list(getattr(self, 'task_conversation_history', []) or getattr(self, 'conversation_history', []))
+        ))
+        _is_vague_followup = (
+            len(words) <= 12
+            and bool(re.match(r"^(?:and\s+)?(where|what|when|how|which|who|should|is|are|can|do|does|explain|clarify)\b", q, re.IGNORECASE))
+            and bool(re.search(r"\b(first|second|third|next|best|top|worst|one|it|this|that|there|them|see|visit|go|do|start|begin|recommend|previous|last)\b", q, re.IGNORECASE))
+        )
+        if (not _is_vague_followup) and bool(re.match(r"^\s*and\s+what\s+about\b", q, re.IGNORECASE)):
+            _is_vague_followup = True
+        _is_explain_prev = bool(re.search(
+            r"\b(explain|clarify|elaborate|summari[sz]e|what\s+(did|have)\s+you\s+(write|say|send)|"
+            r"what\s+you\s+(wrote|write|said|sent)|that\s+answer|previous\s+(answer|reply|response|message)|"
+            r"last\s+(answer|reply|response|message))\b",
+            q, re.IGNORECASE,
+        ))
+        if not (_has_data_kw or _is_vague_followup or _is_explain_prev):
+            return ""
+        if re.search(r"https?://", q):
+            return ""
+        hist = list(getattr(self, "task_conversation_history", []) or getattr(self, "conversation_history", []))
         if not hist:
-            hist = list(getattr(self, 'conversation_history', []))
-        if not hist:
-            return ''
-        # Find last non-trivial user question
-        last_user_q = ''
-        for turn in reversed(hist[-8:]):
-            u = (turn.get('user') or '').strip()
-            if u and len(u.split()) >= 4 and not self._is_smalltalk_query(u.lower()):
-                last_user_q = u
-                break
+            hist = list(getattr(self, "conversation_history", []))
+        last_user_q = ""
+        if hist:
+            for turn in reversed(hist[-8:]):
+                u = (turn.get("user") or "").strip()
+                if u and len(u.split()) >= 2 and not self._is_smalltalk_query(u.lower()):
+                    last_user_q = u
+                    break
+        if not last_user_q:
+            last_user_q = (getattr(self, "last_user_message", "") or "").strip()
         if not last_user_q or last_user_q.lower() == q.lower():
-            return ''
+            return ""
+        if _is_explain_prev:
+            last_reply = (getattr(self, "last_assistant_message", "") or "").strip()
+            return (
+                "FOLLOW-UP ALERT: The user asks about your previous response. "
+                f"Previous user prompt: \"{last_user_q}\". "
+                f"Previous assistant response excerpt: \"{last_reply[:700]}\". "
+                "Explain/refine THAT response, do not switch topics."
+            )
         return (
-            f"FOLLOW-UP ALERT: The user's current message is a short follow-up. "
-            f"The previous question was: \"{last_user_q}\". "
-            f"Interpret the current message as continuing THAT topic — not as a new independent query. "
-            f"Do NOT answer with generic date/time data just because a year was mentioned. "
-            f"Example: 'give me numbers data of 2026' after asking about Claude AI vs ChatGPT = "
-            f"'give me 2026 user numbers about Claude AI vs ChatGPT'."
+            "FOLLOW-UP ALERT: The user message continues the previous topic. "
+            f"Previous user prompt: \"{last_user_q}\". "
+            "Interpret this as continuation, not a new independent query."
         )
 
     def _expand_query_with_context(self, user_input):
@@ -4749,9 +7908,11 @@ class WindowsAgent:
                 last_user_q = u
                 break
         if not last_user_q:
+            last_user_q = (getattr(self, "last_user_message", "") or "").strip()
+        if not last_user_q:
             return user_input
         # Append the last topic to the current query
-        return f"{user_input} — context: {last_user_q}"
+        return f"{user_input} - context: {last_user_q}"
 
     def _resolve_pronoun_query(self, query):
         """If query is mostly pronouns, resolve the actual topic from conversation history."""
@@ -4917,18 +8078,18 @@ class WindowsAgent:
             variants.append(self._normalize_web_query(q + " live data"))
         if re.search(r"\b(who|what|when|where|why|how)\b", low):
             variants.append(self._normalize_web_query("fact check " + q))
-        # Sports winner queries â add a direct "result" variant
+        # Sports winner queries Ã¢Â€Â” add a direct "result" variant
         if re.search(r"\b(won|winner|champion|champions|title|cup|trophy|final|finals)\b", low):
             variants.append(self._normalize_web_query(q + f" {datetime.now().year} result"))
-        # Match schedule queries â add competition + year context to surface exact dates/times
+        # Match schedule queries Ã¢Â€Â” add competition + year context to surface exact dates/times
         year = datetime.now().year
         if re.search(r"\bvs\.?\b|\bversus\b|\bmatch\b|\bgame\b|\bfixture\b", low):
             variants.append(self._normalize_web_query(q + f" {year} date time"))
             variants.append(self._normalize_web_query(q + f" {year} schedule kick off"))
             # CAF-specific expansion for North-African clubs
-            if re.search(r"\b(est|espÃ©rance|taraji|ahly|al ahly|zamalek|wydad|raja|sfaxien|usm alger)\b", low):
+            if re.search(r"\b(est|espÃƒÂ©rance|taraji|ahly|al ahly|zamalek|wydad|raja|sfaxien|usm alger)\b", low):
                 variants.append(self._normalize_web_query(q + f" CAF Champions League {year} quarter final"))
-        # "when is X vs Y" / "next match X" â same treatment
+        # "when is X vs Y" / "next match X" Ã¢Â€Â” same treatment
         if re.search(r"\b(when|next match|next game|next fixture)\b", low) and re.search(r"\bvs\.?\b|\bversus\b|taraji|ahly|est\b", low):
             variants.append(self._normalize_web_query(q + f" {year} CAF Champions League schedule"))
         out = []
@@ -4958,9 +8119,9 @@ class WindowsAgent:
                 seen_urls.add(url)
                 pending.append((r, q))
 
-        # Step 2: Fetch URL excerpts IN PARALLEL â massive speedup vs sequential
+        # Step 2: Fetch URL excerpts IN PARALLEL Ã¢Â€Â” massive speedup vs sequential
         # Skip fetching if the search API already returned a good snippet (Brave/Tavily do this).
-        _GOOD_SNIPPET_MIN = 180  # chars â if snippet is this long, skip URL fetch
+        _GOOD_SNIPPET_MIN = 180  # chars Ã¢Â€Â” if snippet is this long, skip URL fetch
         _URL_FETCH_WORKERS = 6   # fetch up to 6 URLs simultaneously
         _URL_FETCH_TIMEOUT = 6   # seconds per URL
 
@@ -5001,7 +8162,7 @@ class WindowsAgent:
                         except Exception:
                             pass
                 except Exception:
-                    # Overall timeout expired â return whatever evidence collected so far
+                    # Overall timeout expired Ã¢Â€Â” return whatever evidence collected so far
                     pass
 
         evidence.sort(key=lambda x: (x.get("score", 0), len(x.get("excerpt", ""))), reverse=True)
@@ -5077,7 +8238,7 @@ class WindowsAgent:
                         f"You are Opuntia, an intelligent assistant. Today is {now_str}.\n\n"
                         "You have just performed a real-time web search. Use BOTH the web results AND your training knowledge.\n\n"
                         "## Answer structure (always follow this)\n"
-                        "1. **Direct answer first** â open with the key fact, date, name, or result. No preamble.\n"
+                        "1. **Direct answer first** Ã¢Â€Â” open with the key fact, date, name, or result. No preamble.\n"
                         "2. **Scale depth to the question:**\n"
                         "   - Simple fact ? 1-3 sentences with inline citations [1][2].\n"
                         "   - Technical/complex ? ## Overview + sections (explanation, examples, comparison table if useful, implications).\n"
@@ -5086,8 +8247,8 @@ class WindowsAgent:
                         "4. Flow: definition ? explanation ? examples/applications ? implications.\n"
                         "5. If results conflict, note it clearly.\n"
                         "6. No filler: never start with 'Great question!', 'Certainly!', 'Based on the provided information', 'Let me search', '[Searching...]'.\n"
-                        "7. Do NOT write a Sources or References section â sources are appended automatically.\n"
-                        "8. **CRITICAL â Never deflect when results exist:** If the exact answer isn't in the results, present the closest available information. NEVER say 'I couldn't find', 'I don't have information', 'I was unable to locate', or 'please check manually' when search results are present. Commit to an answer using what was found."
+                        "7. Do NOT write a Sources or References section Ã¢Â€Â” sources are appended automatically.\n"
+                        "8. **CRITICAL Ã¢Â€Â” Never deflect when results exist:** If the exact answer isn't in the results, present the closest available information. NEVER say 'I couldn't find', 'I don't have information', 'I was unable to locate', or 'please check manually' when search results are present. Commit to an answer using what was found."
                     ),
                 },
                 {"role": "system", "content": web_context[:12000]},
@@ -5100,7 +8261,7 @@ class WindowsAgent:
                 if u and u not in src_urls:
                     src_urls.append(u)
             if src_urls:
-                answer += "\n\n**Sources:** " + " Â· ".join(f"[{i}] {u}" for i, u in enumerate(src_urls, 1))
+                answer += "\n\n**Sources:** " + " Ã‚Â· ".join(f"[{i}] {u}" for i, u in enumerate(src_urls, 1))
             self.last_live_web_query = query
             return answer
         except Exception:
@@ -5284,8 +8445,8 @@ class WindowsAgent:
             if current:
                 lines.append(
                     "Now: "
-                    f"{current.get('temperature_2m', 'N/A')}Â°C, "
-                    f"feels {current.get('apparent_temperature', 'N/A')}Â°C, "
+                    f"{current.get('temperature_2m', 'N/A')}Ã‚Â°C, "
+                    f"feels {current.get('apparent_temperature', 'N/A')}Ã‚Â°C, "
                     f"wind {current.get('wind_speed_10m', 'N/A')} km/h, "
                     f"precip {current.get('precipitation', 'N/A')} mm"
                 )
@@ -5295,7 +8456,7 @@ class WindowsAgent:
                 temp = temps[i] if i < len(temps) else "N/A"
                 pop = pops[i] if i < len(pops) else "N/A"
                 wind = winds[i] if i < len(winds) else "N/A"
-                lines.append(f"  - {t}: {temp}Â°C, rain {pop}%, wind {wind} km/h")
+                lines.append(f"  - {t}: {temp}Ã‚Â°C, rain {pop}%, wind {wind} km/h")
             lines.append(f"Source: {url}")
             return "\n".join(lines)
         except Exception as e:
@@ -5677,13 +8838,14 @@ class WindowsAgent:
             with sync_playwright() as pw:
                 browser = pw.chromium.launch(headless=self.browser_headless)
                 page = browser.new_page()
-                
+
                 # Navigate with timeout
                 page.goto(url, wait_until='domcontentloaded', timeout=self.browser_timeout_ms)
-                
+
                 # Wait for content to load
                 page.wait_for_timeout(self.browser_wait_load_ms)
-                
+                self._inject_opuntia_banner(page, f"Browsing · {url[:80]}")
+
                 # Extract title
                 try:
                     result['title'] = page.title()[:200]
@@ -5810,7 +8972,7 @@ class WindowsAgent:
             f"You are Opuntia, a smart Windows desktop AI assistant created by the Opuntia Team. Today is {now_str}.\n\n"
             "## Who you are (use when asked about yourself or compared to other AI tools)\n"
             "Opuntia is a full-featured Windows AI agent: desktop automation, app management, real-time web search, "
-            "URL browsing, weather, prayer times, file & folder management, screen capture & vision, voice input (EN/FR/AR), "
+            "URL browsing, weather, file & folder management, screen capture & vision, voice input (EN/FR/AR), "
             "memory & learning, document generation (PDF/Word/Excel/PowerPoint), system controls, advanced AI reasoning, "
             "and a full data & analytics engine: "
             "load CSV/Excel files with pandas, compute statistics (mean, variance, correlation, regression), "
@@ -5846,11 +9008,11 @@ class WindowsAgent:
         try:
             answer = self._strip_ai_sources(self._call_ai(synthesis_messages))
 
-            # Append top 3 sources only â clean, compact footer
+            # Append top 3 sources only Ã¢Â€Â” clean, compact footer
             if self.source_attribution_enabled and all_results:
                 top3 = [r for r in all_results[:3] if r.get('url')]
                 if top3:
-                    answer += "\n\n**Sources:** " + " Â· ".join(
+                    answer += "\n\n**Sources:** " + " Ã‚Â· ".join(
                         f"[{i}] {r.get('url', '')}" for i, r in enumerate(top3, 1)
                     )
 
@@ -5970,7 +9132,7 @@ class WindowsAgent:
             max_iterations=self.search_max_iterations
         )
         
-        # Step 3: Deep browse top results if enabled â fetch ALL in parallel
+        # Step 3: Deep browse top results if enabled Ã¢Â€Â” fetch ALL in parallel
         if self.search_deep_browse:
             # Collect (result_dict, url) pairs that need deep browsing
             to_browse = []
@@ -6056,6 +9218,15 @@ class WindowsAgent:
     def _needs_advanced_search(self, user_input):
         """Determine if query needs advanced internet search vs simple lookup."""
         t = (user_input or "").lower()
+
+        if re.search(
+            r"\b(explain|clarify|elaborate|what\s+(did|have)\s+you\s+(write|say|send)|"
+            r"what\s+you\s+(wrote|said|sent)|that\s+answer|previous\s+(answer|reply|response)|"
+            r"last\s+(answer|reply|response))\b",
+            t,
+            flags=re.IGNORECASE,
+        ) and not re.search(r"\b(search|internet|web|online|sources?|latest|news|current)\b", t, flags=re.IGNORECASE):
+            return False
         
         # Check for explicit search requests
         explicit_patterns = [
@@ -6092,7 +9263,7 @@ class WindowsAgent:
         if self._is_smalltalk_query(t):
             return False, 0.95, "smalltalk", "none"
         
-        # Questions ABOUT the AI itself â answer from self-knowledge, never search internet
+        # Questions ABOUT the AI itself Ã¢Â€Â” answer from self-knowledge, never search internet
         ai_self_patterns = [
             r'\b(what (llm|model|ai|gpt|gemini|qwen)|which (model|ai)|what (kind|type) of (ai|model|assistant))\b',
             r'\b(who (made|created|built|developed) you|your (creator|developer|company|maker))\b',
@@ -6100,7 +9271,8 @@ class WindowsAgent:
             r'\b(your (name|version|capabilities|abilities|features|skills|tasks|functions|tech))\b',
             r'\b(what (can|could) you (do|help|perform|handle|assist))\b',
             r'\b(what (tasks?|things?|features?|tech|automation|tools?|commands?) (can you|do you|are you able|you can|you support|you have))\b',
-            r'\bpÃ©ar\b',
+            r'\bpÃƒÂ©ar\b',
+            r'\bopuntia\b',  # Any question mentioning Opuntia by name is about THIS assistant
             r'\b(about you|about yourself|your main|your purpose|your role)\b',
             r'\b(how (do|does|did) you work|how you work|explain (how|the way) you work|how are you (built|made|designed|working))\b',
             r'\b(explain (yourself|to me how you|your (working|function|system|design)))\b',
@@ -6114,7 +9286,7 @@ class WindowsAgent:
         if any(re.search(p, t) for p in ai_self_patterns):
             return False, 0.90, "ai_self_reference", "none"
 
-        # Questions about the current conversation â use conversation history, never search
+        # Questions about the current conversation Ã¢Â€Â” use conversation history, never search
         conversation_self_patterns = [
             r'\b(this conversation|our conversation|what (we|i) (said|talked|discussed|asked|mentioned))\b',
             r'\b(what did (we|i|you) (talk|say|discuss|ask|mention))\b',
@@ -6126,7 +9298,7 @@ class WindowsAgent:
         if any(re.search(p, t) for p in conversation_self_patterns):
             return False, 0.95, "conversation_context", "none"
 
-        # System commands â only block if it's clearly a desktop action, not an information question
+        # System commands Ã¢Â€Â” only block if it's clearly a desktop action, not an information question
         system_action_patterns = [
             r'\b(open|close|launch|run|quit|exit|stop|start)\s+(the\s+)?(app|application|program|file|folder|window|chrome|firefox|notepad|explorer|task\s*manager)\b',
             r'\b(take\s+a?\s*screenshot|capture\s+(screen|display))\b',
@@ -6166,13 +9338,13 @@ class WindowsAgent:
             return True, 0.95, "time_sensitive", "realtime"
         if _has_all(r'\b(stock|crypto|bitcoin|price|market|share)\b', r'\b(now|today|current|live|latest)\b'):
             return True, 0.95, "time_sensitive", "realtime"
-        # "current/live/latest price of X" â works regardless of word order
+        # "current/live/latest price of X" Ã¢Â€Â” works regardless of word order
         if _has_all(r'\b(price|cost|rate|value)\b', r'\b(current|now|today|live|latest)\b'):
             return True, 0.95, "time_sensitive", "realtime"
         if _has_all(r'\b(score|result|game|match)\b', r'\b(live|today|yesterday|current)\b'):
             return True, 0.95, "time_sensitive", "realtime"
 
-        # Volatile information â any mention of price/availability without time marker still needs web
+        # Volatile information Ã¢Â€Â” any mention of price/availability without time marker still needs web
         volatile_patterns = [
             (r'\b(stock price|share price|crypto price|bitcoin price|ethereum price)\b', "lookup"),
             (r'\b(availability|status|open|closed)\b', "lookup"),
@@ -6196,7 +9368,7 @@ class WindowsAgent:
         if self._needs_advanced_search(user_input):
             return True, 0.90, "explicit_request", "comprehensive"
 
-        # Sports, competitions, tournaments â always need internet (results change every week)
+        # Sports, competitions, tournaments Ã¢Â€Â” always need internet (results change every week)
         sports_patterns = [
             r'\b(who|which)\b.{0,40}\b(won|win|winner|champion|champions|beat|defeated|title|trophy|cup|league|tournament|championship)\b',
             r'\b(last|latest|recent|current|2024|2025|2026)\b.{0,40}\b(champion|winner|winners|champions|ucl|nba|nfl|premier league|la liga|serie a|bundesliga|ligue 1|world cup|euros|nhl|mlb)\b',
@@ -6207,7 +9379,7 @@ class WindowsAgent:
         if any(re.search(p, t) for p in sports_patterns):
             return True, 0.92, "sports_realtime", "realtime"
 
-        # People, celebrities, public figures — ALWAYS search internet.
+        # People, celebrities, public figures â€” ALWAYS search internet.
         # Even if training data has info, internet may have more current/accurate data.
         person_patterns = [
             r'\b(how old is|age of|born in|birthday of|net worth of|salary of)\b',
@@ -6219,7 +9391,7 @@ class WindowsAgent:
         if any(re.search(p, t) for p in person_patterns):
             return True, 0.88, "people_facts", "lookup"
 
-        # Comparison / difference queries — always search
+        # Comparison / difference queries â€” always search
         if re.search(
             r'\b(diffr?e?r?e?n[cs]e?s?|compar\w*|versus|vs\.?|contrast|similarities|pros\s+and\s+cons)\b',
             t, re.IGNORECASE
@@ -6227,7 +9399,7 @@ class WindowsAgent:
             return True, 0.88, "comparison_lookup", "lookup"
 
         # Any question that contains what looks like a proper name (2+ capitalized words)
-        # that isn't a common word — search internet
+        # that isn't a common word â€” search internet
         proper_names = re.findall(r'\b[A-Z][a-z]{2,}\b', user_input)
         common_words = {
             'The', 'What', 'Who', 'How', 'When', 'Where', 'Why', 'Is', 'Are', 'Was',
@@ -6243,7 +9415,7 @@ class WindowsAgent:
 
         # ===== PHASE 3: Default to INTERNAL knowledge =====
 
-        # General knowledge questions â search if temporal marker present, else use training data
+        # General knowledge questions Ã¢Â€Â” search if temporal marker present, else use training data
         general_patterns = [
             r'\b(what (is|are)|when|where|why|how)\b',
             r'\b(explain|define|describe)\b',
@@ -6267,7 +9439,7 @@ class WindowsAgent:
         When has_live_screen=True, skips internet routing and answers from the
         pre-built messages which already contain the live screen context.
         """
-        # When live screen is active, ALWAYS use the pre-built context â never search the internet
+        # When live screen is active, ALWAYS use the pre-built context Ã¢Â€Â” never search the internet
         if has_live_screen and messages is not None:
             try:
                 return self._call_ai(messages)
@@ -6276,9 +9448,30 @@ class WindowsAgent:
 
         # Step 1: Analyze and route
         use_internet, confidence, reason, search_type = self._determine_search_or_internal(user_input)
+        _messages = messages if isinstance(messages, list) else []
+        _followup_locked = any(
+            isinstance(m, dict) and m.get("role") == "system" and ("FOLLOW-UP ALERT" in str(m.get("content") or ""))
+            for m in _messages
+        ) or bool(
+            re.search(
+                r"\b(explain|clarify|elaborate|what\s+(did|have)\s+you\s+(write|say|send)|"
+                r"what\s+you\s+(wrote|said|sent)|that\s+answer|previous\s+(answer|reply|response)|"
+                r"last\s+(answer|reply|response))\b",
+                str(user_input or ""),
+                flags=re.IGNORECASE,
+            )
+        )
+        _anchor_locked = bool(self._topic_anchor_hint(user_input))
+        _explicit_web = bool(
+            re.search(r"\b(search|internet|web|online|sources?|latest|news|current)\b", str(user_input or ""), flags=re.IGNORECASE)
+        )
+        if (_followup_locked or _anchor_locked) and not _explicit_web:
+            use_internet = False
+            reason = "followup_context"
+            search_type = "none"
 
-        # Step 2: Override with explicit user request â but never override self-reference or smalltalk
-        if reason not in ("ai_self_reference", "smalltalk") and self._needs_advanced_search(user_input):
+        # Step 2: Override with explicit user request Ã¢Â€Â” but never override self-reference or smalltalk
+        if reason not in ("ai_self_reference", "smalltalk", "followup_context") and self._needs_advanced_search(user_input):
             use_internet = True
             confidence = 0.90
             search_type = "comprehensive"
@@ -6305,7 +9498,7 @@ class WindowsAgent:
         except Exception:
             return "I encountered an error processing your request."
 
-        # Step 5: Uncertain-answer retry — if the LLM answered with hedged/unknown language,
+        # Step 5: Uncertain-answer retry â€” if the LLM answered with hedged/unknown language,
         # it means it didn't know the topic. Automatically retry with web search.
         _uncertainty_phrases = [
             "not a well-known", "not widely recognized", "without specific information",
@@ -6317,7 +9510,7 @@ class WindowsAgent:
             "existence and development status are unclear",
         ]
         _ans_lower = _internal_answer.lower()
-        if any(ph.lower() in _ans_lower for ph in _uncertainty_phrases):
+        if (not _followup_locked) and (not _anchor_locked) and any(ph.lower() in _ans_lower for ph in _uncertainty_phrases):
             try:
                 _web_result = self.advanced_internet_search(user_input, auto_synthesize=True)
                 if _web_result and len(_web_result.strip()) > 80:
@@ -6335,27 +9528,51 @@ class WindowsAgent:
                 "content": (
                     f"You are Opuntia, a smart Windows desktop AI assistant created by the Opuntia Team.\n"
                     f"Current date and time: {now}.\n\n"
-                    "Opuntia's capabilities: desktop automation, app management, real-time web search, URL browsing, weather, prayer times, file/folder management, screen capture & vision, voice input, conversation memory, skills system, system controls (volume/brightness/WiFi/Bluetooth).\n\n"
+                    "Opuntia's capabilities: desktop automation, app management, real-time web search, URL browsing, weather, file/folder management, screen capture & vision, voice input, conversation memory, skills system, system controls (volume/brightness/WiFi/Bluetooth).\n\n"
                     "## Response format & style\n"
                     "**Structure every answer like this:**\n"
-                    "- **Direct answer first** â open with the key fact or result, no preamble.\n"
+                    "- **Direct answer first** Ã¢Â€Â” open with the key fact or result, no preamble.\n"
                     "- **Headings** (##) for multi-section answers; skip for short factual replies.\n"
                     "- **Bullet points** for lists of 3+ items; **tables** when comparing options.\n"
                     "- **Bold** key facts, names, numbers, and important terms.\n"
                     "- Logical flow: definition ? explanation ? examples/implications.\n"
                     "- **Adapt depth**: short query = concise direct answer; complex query = structured breakdown with sections.\n"
-                    "- **No filler** â never start with 'Great question!', 'Certainly!', 'Of course!', or 'Based on the information provided'.\n"
+                    "- **No filler** Ã¢Â€Â” never start with 'Great question!', 'Certainly!', 'Of course!', or 'Based on the information provided'.\n"
                     "- Cite web sources inline as [1][2] when live results are in context.\n"
                     "- NEVER say you cannot search the internet. NEVER say 'shutting down' unless asked to close.\n"
-                    "- When asked about your own features or capabilities, answer from your built-in knowledge above â do NOT search the internet."
+                    "- When asked about your own features or capabilities, answer from your built-in knowledge above Ã¢Â€Â” do NOT search the internet."
                 ),
             }
         ]
-        recent = self.conversation_history[-5:]
+        _mode = getattr(self, "input_mode", "chat")
+        _hist = self.task_conversation_history if _mode == "task" else self.conversation_history
+        recent = list(_hist[-5:])
+        if not recent and self.conversation_history:
+            recent = self.conversation_history[-5:]
         if recent:
             ctx = self._format_memory_context(recent)
             if ctx:
                 msgs.append({"role": "system", "content": "Recent conversation:\n" + ctx})
+        elif (self.last_user_message or self.last_assistant_message):
+            msgs.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Recent turn fallback:\n"
+                        f"User: {self.last_user_message[:500]}\n"
+                        f"Assistant: {self.last_assistant_message[:900]}"
+                    ),
+                }
+            )
+        recap_ctx = self._build_session_recap_context(user_input, limit=1)
+        if recap_ctx:
+            msgs.append({"role": "system", "content": recap_ctx[:700]})
+        traj_ctx = self._build_trajectory_context(user_input, limit=1)
+        if traj_ctx:
+            msgs.append({"role": "system", "content": traj_ctx[:750]})
+        anchor_hint = self._topic_anchor_hint(user_input)
+        if anchor_hint:
+            msgs.append({"role": "system", "content": anchor_hint})
         msgs.append({"role": "user", "content": user_input})
         return msgs
 
@@ -6667,7 +9884,7 @@ class WindowsAgent:
                 f"I'll create {summary}. Confirm?",
             )
 
-        # Already authorized â parse and execute
+        # Already authorized Ã¢Â€Â” parse and execute
         ops = self._parse_file_tree_with_ai(user_input, base_path)
         if not ops:
             return None
@@ -6703,7 +9920,7 @@ class WindowsAgent:
         def _to_num(v):
             try:
                 return float(str(v).replace(',', '').replace('%', '')
-                             .replace('$', '').replace('€', '').strip())
+                             .replace('$', '').replace('â‚¬', '').strip())
             except Exception:
                 return None
 
@@ -6728,7 +9945,7 @@ class WindowsAgent:
             raw_labels = [str(ri + 1) for ri in range(len(rows))]
 
         MAX_LBL = 16
-        labels = [l[:MAX_LBL] + '…' if len(l) > MAX_LBL else l for l in raw_labels]
+        labels = [l[:MAX_LBL] + 'â€¦' if len(l) > MAX_LBL else l for l in raw_labels]
 
         # Professional colour palette
         BLUE   = ['#2563EB', '#1B2B4B', '#60A5FA', '#3B82F6', '#93C5FD', '#1D4ED8', '#BFDBFE']
@@ -6860,7 +10077,7 @@ class WindowsAgent:
         lines = text.split('\n')
 
         # 0. Keyword-based formal document type detection (French & English)
-        #    Runs before word-counting so common pronouns ("Nous", "Je"…) don't become titles.
+        #    Runs before word-counting so common pronouns ("Nous", "Je"â€¦) don't become titles.
         _tl = _re.sub(r'\s+', ' ', text.lower())
         if _re.search(r'\battestati[o0]n\s+de\s+prise\s+en\s+charge\b', _tl):
             return 'Attestation de Prise en Charge'
@@ -6868,7 +10085,7 @@ class WindowsAgent:
             return 'Attestation de Prise en Charge'
         if _re.search(r'\bordre\s+de\s+mission\b', _tl):
             return 'Ordre de Mission'
-        if _re.search(r'\bmission\s+professionnelle\b', _tl) and _re.search(r'\bcertifi|mandat[eé]|missionnaire\b', _tl):
+        if _re.search(r'\bmission\s+professionnelle\b', _tl) and _re.search(r'\bcertifi|mandat[eÃ©]|missionnaire\b', _tl):
             return 'Lettre de Mission'
         if _re.search(r'\bmission\s+professionnelle\b', _tl):
             return 'Lettre de Mission'
@@ -6878,7 +10095,7 @@ class WindowsAgent:
             return 'Certification'
         if _re.search(r'\bcontrat\s+de\b', _tl):
             return 'Contrat'
-        if _re.search(r'\bfacture\s+n[°o]|\binvoice\b', _tl):
+        if _re.search(r'\bfacture\s+n[Â°o]|\binvoice\b', _tl):
             return 'Facture'
 
         # 1. Markdown heading in first 6 lines
@@ -6908,7 +10125,7 @@ class WindowsAgent:
                 else:
                     break
             if 1 <= len(caps_words) <= 7:
-                title = ' '.join(caps_words).strip('.,;:–-')
+                title = ' '.join(caps_words).strip('.,;:â€“-')
                 if len(title) > 2:
                     return title
 
@@ -6922,16 +10139,16 @@ class WindowsAgent:
             'am', 'is', 'are', 'was', 'were', 'be', 'been', 'being',
             'have', 'has', 'had', 'do', 'does', 'did', 'can', 'could',
             'will', 'would', 'shall', 'should', 'may', 'might', 'must',
-            'suis', 'es', 'sommes', 'êtes', 'sont', 'était', 'serait',
+            'suis', 'es', 'sommes', 'Ãªtes', 'sont', 'Ã©tait', 'serait',
         }
 
-        # 3. First short non-empty plain-text line (≤ 70 chars, take first 6 words)
+        # 3. First short non-empty plain-text line (â‰¤ 70 chars, take first 6 words)
         #    Skip lines that start with a pronoun or article.
         for line in lines[:4]:
             plain = _re.sub(r'[*#_`\[\]>]', '', line).strip()
             plain = _re.sub(r'[^\x00-\x7F\u00C0-\u024F]+', '', plain).strip()
             if 5 < len(plain) < 70:
-                first_word = plain.split()[0].strip('.,;:–-').lower() if plain.split() else ''
+                first_word = plain.split()[0].strip('.,;:â€“-').lower() if plain.split() else ''
                 if first_word in _BAD_STARTERS:
                     continue
                 words = plain.split()[:6]
@@ -6944,7 +10161,7 @@ class WindowsAgent:
         all_words = [w for w in flat.split() if len(w) > 1]
         # If first word is a bad starter, skip it and try next words for a meaningful title
         skip = 0
-        while skip < min(4, len(all_words)) and all_words[skip].strip('.,;:–-').lower() in _BAD_STARTERS:
+        while skip < min(4, len(all_words)) and all_words[skip].strip('.,;:â€“-').lower() in _BAD_STARTERS:
             skip += 1
         words = all_words[skip:skip + 5]
         candidate = ' '.join(words)
@@ -6967,15 +10184,15 @@ class WindowsAgent:
         if not text:
             return text
 
-        # Arabic content — handled by dedicated Arabic renderer, don't touch
+        # Arabic content â€” handled by dedicated Arabic renderer, don't touch
         if self._is_arabic_content(text):
             return text
 
-        # Already has markdown structure — leave untouched
+        # Already has markdown structure â€” leave untouched
         if _r.search(r'^#{1,4} |^\*\* |^\* |^- |\|.+\|', text, _r.MULTILINE):
             return text
 
-        # Already multi-line with proper paragraph breaks — just fix the title
+        # Already multi-line with proper paragraph breaks â€” just fix the title
         lines_raw = [l.strip() for l in text.split('\n') if l.strip()]
         if len(lines_raw) >= 4:
             # Multi-line content: check if first line is ALL-CAPS title
@@ -6988,7 +10205,7 @@ class WindowsAgent:
                 return f'# {first}\n\n{rest}'
             return text  # already structured enough
 
-        # ── FLAT TEXT: single paragraph or short text with no breaks ────────────
+        # â”€â”€ FLAT TEXT: single paragraph or short text with no breaks â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # Step 1: Protect known abbreviations that contain periods
         #         so sentence splitting doesn't break them.
         ABBREV_MAP = {}
@@ -7004,14 +10221,14 @@ class WindowsAgent:
         # Simpler: do replacement inline
         protected = text
         _abbrevs = [
-            r'\bM\.\s+(?=[A-ZÀ-Û])',      # M. <Name>
+            r'\bM\.\s+(?=[A-ZÀ-ÖØ-Þ])',      # M. <Name>
             r'\bMme\.\s+',
             r'\bMr\.\s+',
             r'\bMs\.\s+',
             r'\bDr\.\s+',
             r'\bProf\.\s+',
-            r'\bN°\s*\d',                  # N°123
-            r'\bn°\s*\d',
+            r'\bNÂ°\s*\d',                  # NÂ°123
+            r'\bnÂ°\s*\d',
             r'C\.I\.N\.\s+',
             r'\bSt\.\s+',
             r'\be\.g\.\s+',
@@ -7033,7 +10250,7 @@ class WindowsAgent:
             protected = _r.sub(pat, _sub_abbrev, protected)
 
         # Step 2: Split into sentences at ". " / "! " / "? " before uppercase
-        sentences = _r.split(r'(?<=[.!?])\s+(?=[A-ZÀ-ÜNL\u00C0-\u00DC])', protected)
+        sentences = _r.split(r'(?<=[.!?])\s+(?=[A-ZÀ-ÖØ-Þ])', protected)
 
         # Also split at known paragraph-starting phrases mid-sentence (no period before them)
         PARA_STARTERS = [
@@ -7041,7 +10258,7 @@ class WindowsAgent:
             r'(Signature\s+et\b)',
             r'(Done\s+at\b)',
             r'(Signed\s+at\b)',
-            r'(Nous\s+confirmons?\b)',   # full word — avoid splitting "confirmons" mid-word
+            r'(Nous\s+confirmons?\b)',   # full word â€” avoid splitting "confirmons" mid-word
             r'(We\s+confirm\b)',
         ]
         expanded = []
@@ -7052,8 +10269,8 @@ class WindowsAgent:
                 if len(parts) >= 3:
                     before = parts[0].strip()
                     match_part = parts[1]
-                    # Keep raw suffix (do NOT strip — stripping removes the space
-                    # between the captured group and the next word, e.g. "Fait à" + " Nice")
+                    # Keep raw suffix (do NOT strip â€” stripping removes the space
+                    # between the captured group and the next word, e.g. "Fait Ã " + " Nice")
                     after_raw = parts[2] if len(parts) > 2 else ''
                     after = after_raw.strip()
                     if before:
@@ -7076,18 +10293,18 @@ class WindowsAgent:
 
         # Step 4: Group sentences into logical paragraphs
         # Rules:
-        #  - Sentence containing "certifions que" / "hereby certify" → break AFTER it
-        #  - Sentence starting with "La mission" → its own paragraph
-        #  - "Fait à" / closing phrase → its own paragraph
-        #  - "Signature" → its own paragraph
-        #  - Trailing name + role → their own lines (bold name)
+        #  - Sentence containing "certifions que" / "hereby certify" â†’ break AFTER it
+        #  - Sentence starting with "La mission" â†’ its own paragraph
+        #  - "Fait Ã " / closing phrase â†’ its own paragraph
+        #  - "Signature" â†’ its own paragraph
+        #  - Trailing name + role â†’ their own lines (bold name)
         paragraphs = []
         i = 0
         while i < len(sentences):
             s = sentences[i]
             sl = s.lower()
 
-            # Closing phrase — standalone paragraph
+            # Closing phrase â€” standalone paragraph
             if _r.match(r'fait\s+[àa]\b|done\s+in\b|signed\s+at\b', sl):
                 # Split "Signature et cachet" out if it's embedded in the same sentence
                 _sig_m = _r.search(r'\s+(Signature\s+et\b)', s, _r.IGNORECASE)
@@ -7141,8 +10358,8 @@ class WindowsAgent:
                 else:
                     break
             if 1 <= len(caps_words) <= 7:
-                title_text = ' '.join(caps_words).strip('.,;:–-')
-                first_body = first_text[len(' '.join(caps_words)):].strip().lstrip('.,;:– ')
+                title_text = ' '.join(caps_words).strip('.,;:â€“-')
+                first_body = first_text[len(' '.join(caps_words)):].strip().lstrip('.,;:â€“ ')
                 paragraphs[0] = ('body', first_body) if first_body else None
 
         # Step 6: Build structured output
@@ -7173,24 +10390,24 @@ class WindowsAgent:
                 for _sl in sig_lines:
                     if not _sl:
                         continue
-                    # Split "Signature et cachet de la société M. Prénom NOM Rôle – Société"
+                    # Split "Signature et cachet de la sociÃ©tÃ© M. PrÃ©nom NOM RÃ´le â€“ SociÃ©tÃ©"
                     # into: label line / name line / role line
                     _name_m = _r.search(
-                        r'\s+((?:M\.|Mme\.|Dr\.|Me\.)\s+\S+\s+[A-ZÀÁÂÄÇÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ]\S+)',
+                        r'\s+((?:M\.|Mme\.|Dr\.|Me\.)\s+\S+\s+[A-ZÀ-ÖØ-Þ]\S+)',
                         _sl)
                     if _name_m:
                         _label = _sl[:_name_m.start()].strip()
                         _rest_sig = _sl[_name_m.start():].strip()
-                        # Further split name from role: "M. Prénom NOM Rôle"
+                        # Further split name from role: "M. PrÃ©nom NOM RÃ´le"
                         # Role usually starts after the last ALL-CAPS word of the name
                         _role_m = _r.search(
-                            r'^((?:M\.|Mme\.|Dr\.|Me\.)\s+\S+\s+[A-ZÀÁÂÄÇÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ][A-ZÀÁÂÄÇÈÉÊËÌÍÎÏÒÓÔÖÙÚÛÜ]+)\s+(.+)$',
+                            r'^((?:M\.|Mme\.|Dr\.|Me\.)\s+\S+\s+[A-ZÀ-ÖØ-Þ][A-ZÀ-ÖØ-Þ]+)\s+(.+)$',
                             _rest_sig)
                         if _label:
                             out_lines.append(_label)
                         if _role_m:
                             out_lines.append(_role_m.group(1))   # "M. Hichem KABOUDI"
-                            out_lines.append(_role_m.group(2))   # "Gérant – Liberty Com System Tunisie"
+                            out_lines.append(_role_m.group(2))   # "GÃ©rant â€“ Liberty Com System Tunisie"
                         else:
                             out_lines.append(_rest_sig)
                     else:
@@ -7208,7 +10425,7 @@ class WindowsAgent:
             from pptx.enum.text import PP_ALIGN
             import re as _re
 
-            # ── Palette ─────────────────────────────────────────────────────────
+            # â”€â”€ Palette â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             C_DARK   = RGBColor(0x0F, 0x20, 0x44)   # deep navy
             C_ACC    = RGBColor(0x25, 0x63, 0xEB)   # electric blue
             C_TEAL   = RGBColor(0x06, 0xB6, 0xD4)   # teal accent stripe
@@ -7220,7 +10437,7 @@ class WindowsAgent:
             C_SECT_BG= RGBColor(0x1A, 0x35, 0x6E)   # section slide right panel
             FONT = 'Calibri'
 
-            # ── Geometry (16:9 widescreen) ──────────────────────────────────────
+            # â”€â”€ Geometry (16:9 widescreen) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             W, H = Inches(13.33), Inches(7.5)
 
             prs = Presentation()
@@ -7228,7 +10445,7 @@ class WindowsAgent:
             prs.slide_height = H
             BLANK = prs.slide_layouts[6]
 
-            # ── Low-level helpers ────────────────────────────────────────────────
+            # â”€â”€ Low-level helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def rect(sl, l, t, w, h, col):
                 shp = sl.shapes.add_shape(1, Inches(l), Inches(t), Inches(w), Inches(h))
                 shp.fill.solid(); shp.fill.fore_color.rgb = col
@@ -7259,13 +10476,13 @@ class WindowsAgent:
                     else:
                         plain_run(para, seg, size, col, bold=bold_base)
 
-            # ── Content parser ──────────────────────────────────────────────────
-            # Each # heading → new slide.  ## / ### → sub-heading in slide.
+            # â”€â”€ Content parser â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Each # heading â†’ new slide.  ## / ### â†’ sub-heading in slide.
             # If NO # headings exist, ## headings are promoted to slide titles.
-            # Bullets, numbered lists, body text → blocks inside current slide.
+            # Bullets, numbered lists, body text â†’ blocks inside current slide.
             # Tuple format: (kind, text, level)
 
-            # Strip Sources / References lines — they don't belong on presentation slides
+            # Strip Sources / References lines â€” they don't belong on presentation slides
             _src_pat = _re.compile(
                 r'^\s*\*{0,2}(?:sources?|references?|bibliography|footnotes?|citations?)\*{0,2}\s*[:\-]',
                 _re.IGNORECASE,
@@ -7301,7 +10518,7 @@ class WindowsAgent:
                 m2 = _re.match(r'^##\s+(.+)', ln)
                 if m2:
                     if not _has_h1:
-                        # No H1 in content — promote H2 to slide title
+                        # No H1 in content â€” promote H2 to slide title
                         _push(); cur = {'title': m2.group(1).strip(), 'blocks': []}
                     else:
                         cur['blocks'].append(('h2', m2.group(1).strip(), 0))
@@ -7309,7 +10526,7 @@ class WindowsAgent:
                 m3 = _re.match(r'^###\s+(.+)', ln)
                 if m3:
                     cur['blocks'].append(('h3', m3.group(1).strip(), 0)); continue
-                mb = _re.match(r'^(\s*)[\-\*•]\s+(.+)', ln)
+                mb = _re.match(r'^(\s*)[\-\*â€¢]\s+(.+)', ln)
                 if mb:
                     lvl = len(mb.group(1)) // 2
                     cur['blocks'].append(('bullet', mb.group(2).strip(), lvl)); continue
@@ -7326,12 +10543,12 @@ class WindowsAgent:
             _push()
 
             if not slides_raw:
-                slides_raw = [{'title': doc_title or 'Présentation', 'blocks':
+                slides_raw = [{'title': doc_title or 'PrÃ©sentation', 'blocks':
                     [('body', l.strip(), 0) for l in lines if l.strip()]}]
 
-            main_title = doc_title or (slides_raw[0]['title'] or 'Présentation')
+            main_title = doc_title or (slides_raw[0]['title'] or 'PrÃ©sentation')
 
-            # ── Flat-text restructure: convert dense body paragraphs to bullets ───────────
+            # â”€â”€ Flat-text restructure: convert dense body paragraphs to bullets â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # When the entire presentation collapses to 1 slide of body lines,
             # split long sentences into bullet points for readability.
             for _sd in slides_raw:
@@ -7352,7 +10569,7 @@ class WindowsAgent:
                             _expanded_blocks.append((_bk, _bt, _bl))
                     _sd['blocks'] = _expanded_blocks
 
-            # ── Auto-split slides that overflow the content area ──────────────────
+            # â”€â”€ Auto-split slides that overflow the content area â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _BLOCK_H = {'blank': 0.10, 'h2': 0.88, 'h3': 0.62, 'bullet': 0.58, 'num': 0.58, 'body': 0.68}
             _CONTENT_AREA = 7.18 - 1.50  # MAX_Y - TOP
             _MAX_BLOCKS = 5              # hard cap: max non-blank blocks per slide
@@ -7399,7 +10616,7 @@ class WindowsAgent:
             main_title = doc_title or (slides_raw[0]['title'] or main_title)
 
 
-            # ── TITLE SLIDE ─────────────────────────────────────────────────────
+            # â”€â”€ TITLE SLIDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def make_title_slide(title, subtitle=''):
                 sl = prs.slides.add_slide(BLANK)
                 # Full dark background
@@ -7425,7 +10642,7 @@ class WindowsAgent:
                 p3 = tf3.paragraphs[0]; p3.alignment = PP_ALIGN.RIGHT
                 plain_run(p3, f'{len(slides_raw)} sections', 11, C_WHITE)
 
-            # ── SECTION DIVIDER SLIDE ───────────────────────────────────────────
+            # â”€â”€ SECTION DIVIDER SLIDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def make_section_slide(title, num_str=''):
                 sl = prs.slides.add_slide(BLANK)
                 # Left panel: dark
@@ -7448,7 +10665,7 @@ class WindowsAgent:
                 # Accent underline under title
                 rect(sl, 0.4, 5.55, 3.5, 0.05, C_ACC)
 
-            # ── CONTENT SLIDE ───────────────────────────────────────────────────
+            # â”€â”€ CONTENT SLIDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def make_content_slide(title, blocks, slide_num, total):
                 sl = prs.slides.add_slide(BLANK)
                 # Background
@@ -7469,7 +10686,7 @@ class WindowsAgent:
                 p_pg = tf_pg.paragraphs[0]; p_pg.alignment = PP_ALIGN.RIGHT
                 plain_run(p_pg, f'{slide_num}/{total}', 9, C_MUTED)
 
-                # ── Layout decision ────────────────────────────────────────────
+                # â”€â”€ Layout decision â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 pure_bullets = [(k, t, l) for k, t, l in blocks if k in ('bullet', 'num')]
                 others       = [(k, t, l) for k, t, l in blocks if k not in ('bullet', 'num', 'blank')]
                 use_two_col  = len(pure_bullets) >= 6 and len(others) <= 1
@@ -7510,8 +10727,8 @@ class WindowsAgent:
                             p_ = tf_.paragraphs[0]
                             # Dot prefix
                             dot = p_.add_run()
-                            dot.text = ('▸  ' if bk == 'num' else
-                                        ('●  ' if bl == 0 else '○  '))
+                            dot.text = ('â–¸  ' if bk == 'num' else
+                                        ('â—  ' if bl == 0 else 'â—‹  '))
                             dot.font.name = FONT; dot.font.size = Pt(17)
                             dot.font.color.rgb = C_ACC if bl == 0 else C_TEAL
                             dot.font.bold = True
@@ -7549,7 +10766,7 @@ class WindowsAgent:
                 else:
                     _render_blocks(blocks, CL, CW, TOP, MAX_Y)
 
-            # ── CLOSING SLIDE ───────────────────────────────────────────────────
+            # â”€â”€ CLOSING SLIDE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def make_closing_slide(title):
                 sl = prs.slides.add_slide(BLANK)
                 rect(sl, 0, 0, 13.33, 7.5, C_DARK)
@@ -7564,7 +10781,7 @@ class WindowsAgent:
                 p2 = tf2.paragraphs[0]; p2.alignment = PP_ALIGN.CENTER
                 plain_run(p2, title, 20, C_SUB, italic=True)
 
-            # ── ASSEMBLE ────────────────────────────────────────────────────────
+            # â”€â”€ ASSEMBLE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Title slide subtitle = first body block of slide[0]
             subtitle = next(
                 (bt for bk, bt, _ in slides_raw[0]['blocks'] if bk == 'body'), ''
@@ -7572,7 +10789,7 @@ class WindowsAgent:
             make_title_slide(main_title, subtitle)
 
             # Decide which slides become content vs section-divider
-            # A slide with ONLY body/h2/h3 items and no bullets → section divider
+            # A slide with ONLY body/h2/h3 items and no bullets â†’ section divider
             section_count = 0
             content_slides = []
             for sd in slides_raw:
@@ -7610,7 +10827,7 @@ class WindowsAgent:
             from openpyxl.utils import get_column_letter
             import re as _re
 
-            # ── Palette (matches PPTX theme) ──────────────────────────────────
+            # â”€â”€ Palette (matches PPTX theme) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             C_HDR_BG  = '0F2044'   # dark navy header
             C_HDR_FG  = 'FFFFFF'   # white text
             C_ACC1    = '2563EB'   # blue
@@ -7628,7 +10845,7 @@ class WindowsAgent:
             def _align(h='left', v='center', wrap=False, indent=0):
                 return Alignment(horizontal=h, vertical=v, wrap_text=wrap, indent=indent)
 
-            # ── Content parsers ───────────────────────────────────────────────
+            # â”€â”€ Content parsers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _is_table(ln): return '|' in ln and ln.strip().startswith('|')
 
             def _parse_table(tlines):
@@ -7640,7 +10857,7 @@ class WindowsAgent:
                 return rows
 
             def _parse_bullet(ln):
-                m = _re.match(r'^(\s*)[-*•]\s+(.+)', ln)
+                m = _re.match(r'^(\s*)[-*â€¢]\s+(.+)', ln)
                 if m: return len(m.group(1)) // 2, m.group(2).strip()
                 m = _re.match(r'^(\s*)\d+[.)]\s+(.+)', ln)
                 if m: return len(m.group(1)) // 2, m.group(2).strip()
@@ -7658,7 +10875,7 @@ class WindowsAgent:
                 if bc >= 2: return 'list'
                 return 'text'
 
-            # ── Split content into sections (H1/H2 → separate sheets) ────────
+            # â”€â”€ Split content into sections (H1/H2 â†’ separate sheets) â”€â”€â”€â”€â”€â”€â”€â”€
             raw_lines = (content or '').splitlines()
             sections = []
             cur_title = doc_title or 'Sheet 1'
@@ -7676,7 +10893,7 @@ class WindowsAgent:
             if not any(s[1] for s in sections):
                 sections = [(doc_title or 'Sheet 1', raw_lines)]
 
-            # ── Write one worksheet ───────────────────────────────────────────
+            # â”€â”€ Write one worksheet â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _write_sheet(ws, title, slines):
                 row = 1
                 # Title banner
@@ -7802,7 +11019,7 @@ class WindowsAgent:
                         c.alignment = _align('left', 'center', wrap=True, indent=1)
                         row += 1
 
-                # Auto-fit column widths (cap 8–60)
+                # Auto-fit column widths (cap 8â€“60)
                 for col_cells in ws.columns:
                     col_letter = get_column_letter(col_cells[0].column)
                     if ws.column_dimensions[col_letter].width > 8:
@@ -7813,7 +11030,7 @@ class WindowsAgent:
                 ws.freeze_panes = 'A3'
                 ws.sheet_properties.tabColor = C_ACC1
 
-            # ── Build workbook ────────────────────────────────────────────────
+            # â”€â”€ Build workbook â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             wb = _xl.Workbook()
             wb.remove(wb.active)
             seen: dict = {}
@@ -7851,8 +11068,14 @@ class WindowsAgent:
         try:
             import html as _html, os as _os
 
-            # ── Content analysis & structuring ───────────────────────────────
-            content = self._analyze_and_structure_content(content or '')
+            # â”€â”€ Content analysis & structuring â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+            # Never fail PDF generation because the formatter hit malformed text.
+            # If structuring crashes, keep original content and proceed.
+            _raw_content = content or ''
+            try:
+                content = self._analyze_and_structure_content(_raw_content)
+            except Exception:
+                content = _raw_content
 
             # Strip leading title from body (avoids rendering it twice)
             if doc_title:
@@ -7861,7 +11084,7 @@ class WindowsAgent:
                 _c = content.strip()
                 # Case 1: body starts with plain title text
                 if _c.lower().startswith(_t.lower()):
-                    _rest = _c[len(_t):].lstrip(' .,;:–-\n')
+                    _rest = _c[len(_t):].lstrip(' .,;:â€“-\n')
                     if _rest:
                         content = _rest
                 else:
@@ -7870,10 +11093,10 @@ class WindowsAgent:
                     if _hm and _hm.group(1).strip().lower() == _t.lower():
                         content = _c[_hm.end():].lstrip('\n')
 
-            # ── Arabic / RTL detection ────────────────────────────────────────
+            # â”€â”€ Arabic / RTL detection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             is_arabic = self._is_arabic_content(content or '')
 
-            # ── Font registration ─────────────────────────────────────────────
+            # â”€â”€ Font registration â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Try professional Windows fonts; fall back to built-in Helvetica
             FN = 'Helvetica'
             FB = 'Helvetica-Bold'
@@ -7982,7 +11205,7 @@ class WindowsAgent:
                 except Exception:
                     return text
 
-            # ── Colour palette ────────────────────────────────────────────────
+            # â”€â”€ Colour palette â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             C_NAVY    = HexColor('#1B2B4B')
             C_BLUE    = HexColor('#2563EB')
             C_BLUE2   = HexColor('#1D4ED8')
@@ -7995,14 +11218,14 @@ class WindowsAgent:
             C_TBL_HDR = HexColor('#1B2B4B')
             C_TBL_ALT = HexColor('#F0F4FF')
 
-            # ── Page & margins ────────────────────────────────────────────────
+            # â”€â”€ Page & margins â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             PW, PH = letter
             LM = 1.1 * inch
             RM = 1.1 * inch
             TM = 1.0 * inch
             BM = 0.9 * inch
 
-            # ── Footer ───────────────────────────────────────────────────────
+            # â”€â”€ Footer â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             _ft_raw = (doc_title or '')[:55]
             # Shape Arabic title for footer (canvas drawString doesn't auto-shape)
             _ft = _shape_arabic(_ft_raw) if (is_arabic and self._is_arabic_content(_ft_raw)) else _ft_raw
@@ -8025,7 +11248,7 @@ class WindowsAgent:
                     canvas_obj.drawRightString(PW - RM, 0.40 * inch, page_str)
                 canvas_obj.restoreState()
 
-            # ── Document ──────────────────────────────────────────────────────
+            # â”€â”€ Document â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             doc = SimpleDocTemplate(
                 filepath, pagesize=letter,
                 leftMargin=LM, rightMargin=RM,
@@ -8033,7 +11256,7 @@ class WindowsAgent:
                 title=doc_title or '', author='Opuntia AI',
             )
 
-            # ── Styles ────────────────────────────────────────────────────────
+            # â”€â”€ Styles â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _S(name, **kw):
                 return ParagraphStyle(name, **kw)
 
@@ -8076,14 +11299,14 @@ class WindowsAgent:
                 fontName=_fn, fontSize=9, textColor=C_MUTED,
                 leading=13, spaceAfter=2, leftIndent=10)
 
-            # ── Inline markdown → ReportLab XML ──────────────────────────────
+            # â”€â”€ Inline markdown â†’ ReportLab XML â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _esc(t):
                 return _html.escape(str(t), quote=False)
 
             def _prep(t):
                 if is_arabic and self._is_arabic_content(t):
                     shaped = _shape_arabic_para(t)
-                    # _AR_BR placeholder must survive HTML-escaping → swap after
+                    # _AR_BR placeholder must survive HTML-escaping â†’ swap after
                     return _esc(shaped).replace(_AR_BR, '<br/>')
                 return _esc(t)
 
@@ -8119,7 +11342,7 @@ class WindowsAgent:
                         out.append(escaped)
                 return ''.join(out)
 
-            # ── Markdown table → ReportLab Table ─────────────────────────────
+            # â”€â”€ Markdown table â†’ ReportLab Table â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             def _flush_table(tlines, section_title=''):
                 # Keep raw text cells for chart generation + Paragraph cells for table
                 raw_rows  = []   # [[str, str, ...], ...]
@@ -8179,7 +11402,7 @@ class WindowsAgent:
                                 pass
                 return result
 
-            # ── Build story ───────────────────────────────────────────────────
+            # â”€â”€ Build story â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             story = []
 
             # Title block
@@ -8200,7 +11423,7 @@ class WindowsAgent:
                 line    = lines[i]
                 stripped = line.strip()
 
-                # ─ Code fences ─────────────────────────────────────────────
+                # â”€ Code fences â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if stripped.startswith('```'):
                     if not in_code_blk:
                         in_code_blk = True
@@ -8220,7 +11443,7 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Tables ──────────────────────────────────────────────────
+                # â”€ Tables â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if stripped.startswith('|'):
                     tbl_acc.append(stripped)
                     i += 1
@@ -8229,7 +11452,7 @@ class WindowsAgent:
                     story += _flush_table(tbl_acc, section_title=last_heading)
                     tbl_acc = []
 
-                # ─ Sources section ─────────────────────────────────────────
+                # â”€ Sources section â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if re.match(r'^\*?\*?sources?\*?\*?\s*:?\s*$', stripped, re.IGNORECASE):
                     in_sources = True
                     story.append(Spacer(1, 10))
@@ -8243,19 +11466,19 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Blank line ──────────────────────────────────────────────
+                # â”€ Blank line â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if not stripped:
                     story.append(Spacer(1, 6))
                     i += 1
                     continue
 
-                # ─ Horizontal rule ─────────────────────────────────────────
+                # â”€ Horizontal rule â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if re.match(r'^[-*_]{3,}$', stripped):
                     story.append(HRFlowable(width='100%', thickness=0.7, color=C_DIVIDER, spaceAfter=6))
                     i += 1
                     continue
 
-                # ─ Headings ────────────────────────────────────────────────
+                # â”€ Headings â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 if stripped.startswith('#### '):
                     last_heading = stripped[5:].strip()
                     story.append(Paragraph(md_to_rl(last_heading), ST_H3))
@@ -8278,7 +11501,7 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Checkbox / checklist ────────────────────────────────────
+                # â”€ Checkbox / checklist â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 _cbm = re.match(r'^[-*+]\s+\[( |x|X)\]\s+(.+)$', stripped)
                 if _cbm:
                     done = _cbm.group(1).lower() == 'x'
@@ -8287,7 +11510,7 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Bullet list ─────────────────────────────────────────────
+                # â”€ Bullet list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 bm = re.match(r'^[\*\-\+\u2022\u25aa]\s+(.+)$', stripped)
                 if bm:
                     story.append(Paragraph(
@@ -8297,7 +11520,7 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Numbered list ───────────────────────────────────────────
+                # â”€ Numbered list â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 nm = re.match(r'^(\d+)[.)]\s+(.+)$', stripped)
                 if nm:
                     story.append(Paragraph(
@@ -8307,13 +11530,13 @@ class WindowsAgent:
                     i += 1
                     continue
 
-                # ─ Tree-style lines (├─ └─ │) ─────────────────────────────
-                if re.match(r'^[\u251c\u2514\u2502\u2500├└│]', stripped):
+                # â”€ Tree-style lines (â”œâ”€ â””â”€ â”‚) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                if re.match(r'^[\u251c\u2514\u2502\u2500â”œâ””â”‚]', stripped):
                     story.append(Paragraph(_esc(stripped), ST_CODE))
                     i += 1
                     continue
 
-                # ─ Regular paragraph ───────────────────────────────────────
+                # â”€ Regular paragraph â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 story.append(Paragraph(md_to_rl(stripped), ST_BODY))
                 i += 1
 
@@ -8349,7 +11572,7 @@ class WindowsAgent:
         if _is_pdf_question and not _has_explicit_name:
             return None
 
-        # Must have a creation/action verb — accept typos like "creat", "crete"
+        # Must have a creation/action verb â€” accept typos like "creat", "crete"
         if not re.search(
             r'\b(creat\w*|make|open|write|save|put|add|start|new|build|generat\w*|produc\w*)\b',
             low
@@ -8359,7 +11582,7 @@ class WindowsAgent:
         name = None
         content = ""
 
-        # "write what you sent/said/have sent last" → use last AI response as content
+        # "write what you sent/said/have sent last" â†’ use last AI response as content
         _last_resp_pat = re.compile(
             r'\b(?:write|put|save|add|create)\s+'
             r'(?:what\s+(?:(?:you|u)(?:\'?ve)?\s+(?:have\s+)?|(?:have|had)\s+(?:you|u)\s+)(?:just\s+)?(?:sent|said|wrote|written|replied?|gave|given)'
@@ -8422,7 +11645,7 @@ class WindowsAgent:
 
         if self._is_capability_question(raw) and not name and not content:
             return (
-                "Yes — I can create a PDF, but I won't do it without explicit approval. "
+                "Yes â€” I can create a PDF, but I won't do it without explicit approval. "
                 "If you want me to create one, say for example: "
                 "\"Create a PDF called X and write: ...\""
             )
@@ -8450,7 +11673,7 @@ class WindowsAgent:
                     elif len(line) <= 60:
                         smart_name = line
                     else:
-                        # Long line — truncate at word boundary
+                        # Long line â€” truncate at word boundary
                         truncated = line[:50].rsplit(' ', 1)[0].rstrip('.,;:')
                         if len(truncated) >= 8:
                             smart_name = truncated
@@ -8518,8 +11741,8 @@ class WindowsAgent:
             self._pending_pdf_save = {"content": content, "name": name, "doc_title": name.replace('.pdf', '')}
             return (
                 f"Ready to create **`{name}`**. Where do you want to save it?\n"
-                f"Say: *desktop* · *documents* · *downloads* · *D drive* · "
-                f"a folder name · or a full path."
+                f"Say: *desktop* Â· *documents* Â· *downloads* Â· *D drive* Â· "
+                f"a folder name Â· or a full path."
             )
         try:
             os.startfile(saved_path)
@@ -8576,7 +11799,7 @@ class WindowsAgent:
             bidi = OxmlElement('w:bidi')
             pPr.insert(0, bidi)
 
-        # Force alignment â always set right or both for Arabic paragraphs.
+        # Force alignment Ã¢Â€Â” always set right or both for Arabic paragraphs.
         # Only preserve 'center' if it was explicitly intended (title/centered heading).
         jc = pPr.find(qn('w:jc'))
         _cur_jc = jc.get(qn('w:val')) if jc is not None else None
@@ -8683,7 +11906,7 @@ class WindowsAgent:
             _t = doc_title.strip()
             _c = content.strip()
             if _c.lower().startswith(_t.lower()):
-                _rest = _c[len(_t):].lstrip(' .,;:–-\n')
+                _rest = _c[len(_t):].lstrip(' .,;:â€“-\n')
                 if _rest:
                     content = _rest
             else:
@@ -8705,7 +11928,7 @@ class WindowsAgent:
             except Exception:
                 pass
             # Set Normal style: 14pt, Arabic font, explicit szCs (complex-script size
-            # used by Arabic text â without it Word falls back to document default ~11pt).
+            # used by Arabic text Ã¢Â€Â” without it Word falls back to document default ~11pt).
             try:
                 normal_style = doc.styles['Normal']
                 normal_style.font.name = arabic_font
@@ -8720,7 +11943,7 @@ class WindowsAgent:
                     _szCs = OxmlElement('w:szCs')
                     _ns_rPr.append(_szCs)
                 _szCs.set(qn('w:val'), '32')   # 16 pt = 32 half-points
-                # Line spacing: 1.5Ã (360 twips) + 6pt space after paragraphs
+                # Line spacing: 1.5ÃƒÂ— (360 twips) + 6pt space after paragraphs
                 _ns_pPr = normal_style.element.find(qn('w:pPr'))
                 if _ns_pPr is None:
                     _ns_pPr = OxmlElement('w:pPr')
@@ -8729,7 +11952,7 @@ class WindowsAgent:
                 if _ns_spacing is None:
                     _ns_spacing = OxmlElement('w:spacing')
                     _ns_pPr.append(_ns_spacing)
-                _ns_spacing.set(qn('w:line'),     '360')   # 1.5Ã line height
+                _ns_spacing.set(qn('w:line'),     '360')   # 1.5ÃƒÂ— line height
                 _ns_spacing.set(qn('w:lineRule'), 'auto')
                 _ns_spacing.set(qn('w:after'),    '120')   # 6 pt spacing after
             except Exception:
@@ -8752,7 +11975,7 @@ class WindowsAgent:
             auto_title = first_content[2:].strip()
         elif first_content.isupper() and len(first_content) > 4:
             auto_title = first_content
-        # Arabic: isupper() never triggers â use first short line as title
+        # Arabic: isupper() never triggers Ã¢Â€Â” use first short line as title
         elif is_arabic and self._is_arabic_content(first_content) and 4 < len(first_content) <= 80:
             auto_title = first_content
         # Use auto-detected title if no explicit title provided (or title is just filename)
@@ -8825,7 +12048,7 @@ class WindowsAgent:
                 added_para = p
 
             elif is_arabic and s and s[0] in '\u2022\u25CF\u2013\u2014':
-                # Unicode bullet/dash lines: "â¢ ?????? ?? ????? ???????"
+                # Unicode bullet/dash lines: "Ã¢Â€Â¢ ?????? ?? ????? ???????"
                 p = doc.add_paragraph(style='List Bullet')
                 self._add_formatted_runs(p, s[1:].strip())
                 added_para = p
@@ -8873,7 +12096,7 @@ class WindowsAgent:
                 r'^[\u0600-\u06FF]{2,12}(?:\s+[\u0600-\u06FF]{2,12}){0,3}\s*(?::|_+|\.{3,})\s*$',
                 s
             ):
-                # Arabic signature/field line: e.g. "الاسم: ___" "التوقيع: ...."
+                # Arabic signature/field line: e.g. "Ø§Ù„Ø§Ø³Ù…: ___" "Ø§Ù„ØªÙˆÙ‚ÙŠØ¹: ...."
                 para = doc.add_paragraph()
                 self._add_formatted_runs(para, s)
                 added_para = para
@@ -8971,7 +12194,7 @@ class WindowsAgent:
                 self._add_formatted_runs(p, s)
                 added_para = p
 
-            # Signature block lines â monospace-friendly, no justification
+            # Signature block lines Ã¢Â€Â” monospace-friendly, no justification
             elif re.match(r'^(signed\s*:|for\s+\w|name\s*:|title\s*:|date\s*:|signature\s*:)', s, re.IGNORECASE):
                 para = doc.add_paragraph()
                 self._add_formatted_runs(para, s)
@@ -9023,7 +12246,7 @@ class WindowsAgent:
 
         # -- Final RTL enforcement pass (Arabic documents only) ----------------
         # Re-visits every paragraph in the document to guarantee that RTL
-        # alignment and font settings are applied â catches any paragraph that
+        # alignment and font settings are applied Ã¢Â€Â” catches any paragraph that
         # may have been created outside the main loop or missed the per-line call.
         if is_arabic:
             for _fp in doc.paragraphs:
@@ -9036,7 +12259,7 @@ class WindowsAgent:
                 _fjc = _fpPr.find(_qn('w:jc')) if _fpPr is not None else None
                 _fjc_val = _fjc.get(_qn('w:val')) if _fjc is not None else None
                 if _fjc_val == 'center':
-                    continue   # already explicitly centered â leave alone
+                    continue   # already explicitly centered Ã¢Â€Â” leave alone
                 _fis_body = not ('Heading' in _fsn or _fsn in ('Title', 'List Bullet'))
                 self._apply_arabic_paragraph(_fp, arabic_font, justify=_fis_body)
 
@@ -9069,13 +12292,13 @@ class WindowsAgent:
             )
             t = re.sub(_ar_label_pat, r'\n\1', t)
             # -- Standalone structural "?" (AND between parties) ? own line ---
-            # "??" is always inline "or" â never split it.
+            # "??" is always inline "or" Ã¢Â€Â” never split it.
             # Only split standalone "?" surrounded by spaces (party separator),
             # not prefix "?" attached to a word (?????? ?????? etc.).
             t = re.sub(
                 r'(?<!\n) ([\u0600-\u06FF]{1,6}) (?=[\u0600-\u06FF])',
                 r'\n\1\n', t)
-            # -- Split at sentence endings only â NOT at commas --------------
+            # -- Split at sentence endings only Ã¢Â€Â” NOT at commas --------------
             # Arabic legal text uses ? heavily within sentences; splitting there
             # breaks party descriptions into many short fragments.
             if t.count('\n') < 3:
@@ -9123,7 +12346,7 @@ class WindowsAgent:
         low = (text or "").strip().lower()
         if not low:
             return False
-        # Must reference a file/folder concept — otherwise any "?" question gets hijacked.
+        # Must reference a file/folder concept â€” otherwise any "?" question gets hijacked.
         _has_file_concept = bool(re.search(
             r'\b(file|folder|directory|create|make|document|pdf|word|docx?|txt|copy|move|delete|rename)\b', low
         ))
@@ -9184,14 +12407,14 @@ class WindowsAgent:
         if re.search(r'\b(txt|text\s+file|\.txt|plain\s+text)\b', low) and not re.search(r'\b(word|docx?|\.docx?)\b', low):
             return None
 
-        # Must explicitly mention Word/doc — "file" alone is too generic.
+        # Must explicitly mention Word/doc â€” "file" alone is too generic.
         _has_word_ref = bool(re.search(r'(word|docx?|\.docx?)', low))
         _has_doc_ref = bool(re.search(r'(document|report)', low))
         _has_write_intent = bool(re.search(
             r'(write|save|put|add|create|make|generate|draft|prepare|export|open|give|build|produc\w*)', low))
         if not _has_word_ref and not (_has_doc_ref and _has_write_intent):
             return None
-        # Must have a creation/action verb — accept typos like "creat", "crete"
+        # Must have a creation/action verb â€” accept typos like "creat", "crete"
         if not re.search(
             r'(creat\w*|make|open|write|save|put|add|start|new|build|generat\w*|produc\w*|draft\w*|prepar\w*|export\w*|give|convert\w*)',
             low
@@ -9248,12 +12471,12 @@ class WindowsAgent:
             # Sanitize illegal Windows filename characters and cap length
             name = re.sub(r'[\\/*?:"<>|]', '', name).strip()[:100]
 
-        # Extract content â match the LAST occurrence of a content-start marker
+        # Extract content Ã¢Â€Â” match the LAST occurrence of a content-start marker
         # so "write this with good layout :" correctly finds the real content start
         content_markers = [
             # "write this inside word doc on my desktop : content"
             # "write this in word doc on my desktop : content"
-            # â skip any phrase between "inside/in" and the colon
+            # Ã¢Â€Â” skip any phrase between "inside/in" and the colon
             r'\bwrite\s+this\s+inside\s+[^:\n]+[:\-]\s*',
             r'\bwrite\s+this\s+in\s+[^:\n]+[:\-]\s*',
             r'\bwrite\s+this\s+inside\s*[:\-]?\s*',
@@ -9288,14 +12511,14 @@ class WindowsAgent:
         # Guard: if this is just a capability question (no filename/content), don't create.
         if self._is_capability_question(raw) and not name and not content:
             return (
-                "Yes — I can create a Word document, but I won't do it without explicit approval. "
+                "Yes â€” I can create a Word document, but I won't do it without explicit approval. "
                 "If you want me to create one, say for example: "
                 "\"Create a Word document called X and write: ...\""
             )
 
         # -- Bare pronoun fallback: "write this/that/it in word doc" ------------
         # When no inline content was provided and user says "this/it/that",
-        # they're referring to the previous AI response â pull it from history.
+        # they're referring to the previous AI response Ã¢Â€Â” pull it from history.
         if not content and re.search(
             r'\b(this|that|it|the\s+last|what\s+(?:(?:you|u)(?:\'?ve)?\s+(?:have\s+)?|(?:have|had)\s+(?:you|u)\s+)(?:sent|said|wrote|written|gave|given))\b',
             low
@@ -9327,7 +12550,7 @@ class WindowsAgent:
             if _is_ar_content or '\n' not in content:
                 content = self._reformat_flat_document_text(content)
 
-        # Fallback name â try to auto-generate from first heading in content
+        # Fallback name Ã¢Â€Â” try to auto-generate from first heading in content
         if not name:
             smart_name = None
             if content:
@@ -9343,7 +12566,7 @@ class WindowsAgent:
                     elif len(line) <= 60:
                         smart_name = line
                     else:
-                        # Long body line â truncate at word boundary (= 50 chars)
+                        # Long body line Ã¢Â€Â” truncate at word boundary (= 50 chars)
                         truncated = line[:50].rsplit(' ', 1)[0].rstrip('.,;:')
                         if len(truncated) >= 8:
                             smart_name = truncated
@@ -9393,7 +12616,7 @@ class WindowsAgent:
                 break
         _inline_folder, _inline_err = self._parse_save_location(_cmd_head)
         if not _inline_err and _inline_folder:
-            # Location was specified inline â create immediately, no question
+            # Location was specified inline Ã¢Â€Â” create immediately, no question
             try:
                 os.makedirs(_inline_folder, exist_ok=True)
             except Exception:
@@ -9408,7 +12631,7 @@ class WindowsAgent:
                 pass
             return f"**Saved and opened** `{name}` in `{_inline_folder}`"
 
-        # No location in command â default to Desktop, create immediately
+        # No location in command Ã¢Â€Â” default to Desktop, create immediately
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
         try:
             os.makedirs(desktop, exist_ok=True)
@@ -9417,12 +12640,12 @@ class WindowsAgent:
         final_path = os.path.join(desktop, name)
         saved_path, create_err = self._create_word_document(final_path, content, doc_title=name.replace('.docx', ''))
         if create_err:
-            # Could not save to desktop â ask for location instead
+            # Could not save to desktop Ã¢Â€Â” ask for location instead
             self._pending_doc_save = {"content": content, "name": name, "doc_title": name.replace('.docx', '')}
             return (
                 f"Ready to create **`{name}`**. Where do you want to save it?\n"
-                f"Say: *desktop* Â· *documents* Â· *downloads* Â· *D drive* Â· "
-                f"a folder name Â· or a full path."
+                f"Say: *desktop* Ã‚Â· *documents* Ã‚Â· *downloads* Ã‚Â· *D drive* Ã‚Â· "
+                f"a folder name Ã‚Â· or a full path."
             )
         try:
             os.startfile(saved_path)
@@ -9497,9 +12720,9 @@ class WindowsAgent:
             pass
         return f"**Word document created** and opened: `{os.path.basename(saved_path)}`"
 
-    # ══════════════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
     #  DATA & ANALYTICS ENGINE
-    # ══════════════════════════════════════════════════════════════════════════
+    # â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
     def _is_data_analysis_intent(self, cmd_lower):
         """Detect data analysis / visualization / API fetch intents."""
@@ -9557,10 +12780,10 @@ class WindowsAgent:
         if df.empty:
             return "The file appears to be empty.", None
 
-        # ── Build report ────────────────────────────────────────────────────
+        # â”€â”€ Build report â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         lines = []
         lines.append(f"## Data Analysis: `{os.path.basename(file_path)}`\n")
-        lines.append(f"**Shape:** {df.shape[0]:,} rows × {df.shape[1]} columns\n")
+        lines.append(f"**Shape:** {df.shape[0]:,} rows Ã— {df.shape[1]} columns\n")
 
         # Column overview
         col_types = []
@@ -9581,7 +12804,7 @@ class WindowsAgent:
             lines.append(desc.to_string())
             lines.append("```\n")
 
-            # Correlation (only if ≥2 numeric columns)
+            # Correlation (only if â‰¥2 numeric columns)
             if len(num_cols) >= 2:
                 corr = df[num_cols].corr().round(3)
                 # Show only strong correlations (|r| > 0.5)
@@ -9595,7 +12818,7 @@ class WindowsAgent:
                         r = corr.loc[c1, c2]
                         if abs(r) > 0.5:
                             direction = "positive" if r > 0 else "negative"
-                            strong.append(f"  - `{c1}` ↔ `{c2}`: r = {r:.3f} ({direction})")
+                            strong.append(f"  - `{c1}` â†” `{c2}`: r = {r:.3f} ({direction})")
                 if strong:
                     lines.append("**Notable Correlations (|r| > 0.5):**\n" + "\n".join(strong) + "\n")
 
@@ -9605,7 +12828,7 @@ class WindowsAgent:
             for col in cat_cols[:5]:  # max 5 columns
                 vc = df[col].value_counts().head(5)
                 top = ", ".join([f"{v} ({c})" for v, c in vc.items()])
-                cat_info.append(f"  - **{col}** — {df[col].nunique()} unique values. Top: {top}")
+                cat_info.append(f"  - **{col}** â€” {df[col].nunique()} unique values. Top: {top}")
             lines.append("**Categorical Columns:**\n" + "\n".join(cat_info) + "\n")
 
         # Missing data summary
@@ -9613,7 +12836,7 @@ class WindowsAgent:
         if total_missing > 0:
             lines.append(f"**Missing Data:** {total_missing:,} total missing values across all columns.\n")
         else:
-            lines.append("**Missing Data:** No missing values — dataset is complete.\n")
+            lines.append("**Missing Data:** No missing values â€” dataset is complete.\n")
 
         # Dataset sample (first 3 rows)
         lines.append("**Sample (first 3 rows):**\n```")
@@ -9817,7 +13040,7 @@ class WindowsAgent:
                 # Summarise large JSON responses
                 text = _json.dumps(data, ensure_ascii=False, indent=2)
                 if len(text) > 6000:
-                    text = text[:6000] + "\n… (truncated)"
+                    text = text[:6000] + "\nâ€¦ (truncated)"
                 return text, ""
             else:
                 text = resp.text[:6000]
@@ -9858,7 +13081,7 @@ class WindowsAgent:
         try:
             wb = _xl.Workbook()
 
-            # ── Sheet 1: Raw Data ─────────────────────────────────────────────
+            # â”€â”€ Sheet 1: Raw Data â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             ws_data = wb.active
             ws_data.title = "Data"
             # Write headers
@@ -9883,7 +13106,7 @@ class WindowsAgent:
                 ws_data.column_dimensions[get_column_letter(ci)].width = min(max_len + 2, 40)
             ws_data.freeze_panes = "A2"
 
-            # ── Sheet 2: Statistics ────────────────────────────────────────────
+            # â”€â”€ Sheet 2: Statistics â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             num_cols = df.select_dtypes(include=[float, int, "number"]).columns.tolist()
             if num_cols:
                 ws_stat = wb.create_sheet("Statistics")
@@ -9906,7 +13129,7 @@ class WindowsAgent:
                     ws_stat.column_dimensions[get_column_letter(ci)].width = 16
                 ws_stat.freeze_panes = "B2"
 
-            # ── Sheet 3: Correlation Matrix ────────────────────────────────────
+            # â”€â”€ Sheet 3: Correlation Matrix â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if len(num_cols) >= 2:
                 ws_corr = wb.create_sheet("Correlation")
                 corr = df[num_cols].corr().round(3)
@@ -9976,7 +13199,7 @@ class WindowsAgent:
 
         desktop = os.path.join(os.path.expanduser("~"), "Desktop")
 
-        # ── 1. API / live-data fetch ─────────────────────────────────────────
+        # â”€â”€ 1. API / live-data fetch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         _url_m = re.search(r'https?://[^\s<>"\']+', user_input)
         if _url_m:
             url = _url_m.group(0).rstrip(".,;!?)")
@@ -9994,7 +13217,7 @@ class WindowsAgent:
                 {"role": "user", "content": prompt},
             ])
 
-        # ── 2. Resolve data file ─────────────────────────────────────────────
+        # â”€â”€ 2. Resolve data file â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         data_file = None
         # Check recently referenced attachment
         if hasattr(self, "last_attachment_paths") and self.last_attachment_paths:
@@ -10017,7 +13240,7 @@ class WindowsAgent:
                 if os.path.exists(candidate):
                     data_file = candidate
 
-        # ── 3. Run analysis ──────────────────────────────────────────────────
+        # â”€â”€ 3. Run analysis â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         if data_file:
             report, df = self._pandas_analyze_file(data_file, user_request=user_input)
 
@@ -10049,7 +13272,7 @@ class WindowsAgent:
                                 break
 
                 chart_title = re.sub(r'[\\/*?:"<>|]', '', os.path.splitext(os.path.basename(data_file))[0])
-                chart_title = f"{chart_type.title()} — {chart_title}"
+                chart_title = f"{chart_type.title()} â€” {chart_title}"
                 chart_path = os.path.join(desktop, re.sub(r'\s+', '_', chart_title) + ".png")
                 saved_chart, cerr = self._generate_visualization(
                     df, chart_type, x_col=x_col, y_col=y_col,
@@ -10083,18 +13306,18 @@ class WindowsAgent:
 
             return report + chart_msg + excel_msg
 
-        # ── 4. No file — AI-powered data question ────────────────────────────
+        # â”€â”€ 4. No file â€” AI-powered data question â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
         # If user mentions stats/analytics concept but no file, answer with AI
         return None  # let intelligent_respond handle it
 
-    def _handle_file_command(self, user_input, allow_desktop=False, allow_mutation=False):
+    def _handle_file_command(self, user_input, allow_desktop=False, allow_mutation=False, allow_outside_mcp=False):
         text = (user_input or "").strip()
         if not text:
             return None
         text = self._rewrite_natural_desktop_file_command(text)
         if self._is_capability_question(text) and not self._has_explicit_target(text):
             return (
-                "Yes — I can create files or folders, but I won't do it without explicit approval. "
+                "Yes â€” I can create files or folders, but I won't do it without explicit approval. "
                 "Tell me the name/location, for example: "
                 "\"Create a folder called X on desktop\"."
             )
@@ -10115,19 +13338,41 @@ class WindowsAgent:
         if is_mutation and allow_mutation:
             self._audit("file_mutation", "allowed", {"command": text[:300]})
 
+        def _outside_write_guard(path_value):
+            if not path_value:
+                return None
+            if self._mcp_write_allowed(path_value):
+                return None
+            if allow_outside_mcp:
+                return None
+            if not allow_mutation:
+                return "Path is outside MCP allowed directories and needs explicit confirmation."
+            return self._set_pending_confirmation(
+                "file_mutation_outside_allowed",
+                {"command": text, "allow_desktop": bool(allow_desktop), "allow_outside_mcp": True},
+                "This write target is outside MCP allowed directories. Continue anyway? (yes/no)",
+            )
+
         m = re.match(r"^(?:list|show)\s+(?:all\s+)?files(?:\s+in\s+(.+))?$", text, flags=re.IGNORECASE)
         if m:
             folder, err = self._resolve_workspace_path((m.group(1) or ".").strip(), allow_desktop=allow_desktop)
             if err:
                 return err
+            if self._prefer_mcp_for_action("list_files"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("list_directory", {"path": folder}, action_key="list_files")
+                if ok and mcp_out:
+                    return f"Files in {os.path.relpath(folder, self.workspace_root)} (via MCP):\n{mcp_out}"
             if not os.path.isdir(folder):
+                self._record_file_route_result("list_files", "local", False, error_text="folder not found")
                 return "Folder not found."
             entries = sorted(os.listdir(folder))
             if not entries:
+                self._record_file_route_result("list_files", "local", True)
                 return f"No files found in {os.path.relpath(folder, self.workspace_root)}"
             lines = []
             for name in entries[:80]:
                 lines.append(f"- {name}{'/' if os.path.isdir(os.path.join(folder, name)) else ''}")
+            self._record_file_route_result("list_files", "local", True)
             return f"Files in {os.path.relpath(folder, self.workspace_root)}:\n" + "\n".join(lines)
 
         m = re.match(r"^(?:read|open|show)\s+file\s+(.+)$", text, flags=re.IGNORECASE)
@@ -10135,16 +13380,24 @@ class WindowsAgent:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
+            if self._prefer_mcp_for_action("read_file"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("read_text_file", {"path": path}, action_key="read_file")
+                if ok and mcp_out:
+                    display_name = os.path.basename(path)
+                    return f"**{display_name}**\n\n{mcp_out[:6000]}" + ("\n\n... (truncated - showing first 6000 characters)" if len(mcp_out) > 6000 else "")
             if not os.path.exists(path) or os.path.isdir(path):
+                self._record_file_route_result("read_file", "local", False, error_text="file not found")
                 return "File not found."
             try:
                 with open(path, "r", encoding="utf-8", errors="replace") as f:
                     content = f.read()
                 if len(content) > 6000:
-                    content = content[:6000] + "\n\n... (truncated â showing first 6000 characters)"
+                    content = content[:6000] + "\n\n... (truncated Ã¢Â€Â” showing first 6000 characters)"
                 display_name = os.path.basename(path)
+                self._record_file_route_result("read_file", "local", True)
                 return f"**{display_name}**\n\n{content}"
             except Exception as e:
+                self._record_file_route_result("read_file", "local", False, error_text=str(e))
                 return f"Could not read file: {e}"
 
         m = re.match(r"^(?:create|make)\s+(?:folder|directory)\s+(.+)$", text, flags=re.IGNORECASE)
@@ -10152,10 +13405,19 @@ class WindowsAgent:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
+            if self._prefer_mcp_for_action("create_folder"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("create_directory", {"path": path}, action_key="create_folder")
+                if ok:
+                    return f"Folder ready: {os.path.relpath(path, self.workspace_root)}" if not mcp_out else str(mcp_out)
             try:
                 os.makedirs(path, exist_ok=True)
+                self._record_file_route_result("create_folder", "local", True)
                 return f"Folder ready: {os.path.relpath(path, self.workspace_root)}"
             except Exception as e:
+                self._record_file_route_result("create_folder", "local", False, error_text=str(e))
                 return f"Could not create folder: {e}"
 
         m = re.match(r"^(?:create|make)\s+file\s+(.+?)\s+with\s+content\s*[:\-]?\s*([\s\S]+)$", text, flags=re.IGNORECASE)
@@ -10163,50 +13425,100 @@ class WindowsAgent:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
-            return self._write_text_file(path, m.group(2), append=False)
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
+            if self._prefer_mcp_for_action("write_file"):
+                payload = (m.group(2) or "").replace("\\n", "\n").replace("\\t", "\t")
+                ok, mcp_out = self._mcp_call_filesystem_tool("write_file", {"path": path, "content": payload}, action_key="write_file")
+                if ok:
+                    return mcp_out or f"Saved file `{os.path.basename(path)}`."
+            out = self._write_text_file(path, m.group(2), append=False)
+            self._record_file_route_result("write_file", "local", False if str(out).lower().startswith("could not") else True, error_text=str(out))
+            return out
 
         m = re.match(r"^(?:create|make)\s+file\s+(.+)$", text, flags=re.IGNORECASE | re.DOTALL)
         if m:
             path, err = self._resolve_workspace_path(m.group(1).strip(), allow_desktop=allow_desktop)
             if err:
                 return err
-            return self._write_text_file(path, "", append=False)
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
+            if self._prefer_mcp_for_action("write_file"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("write_file", {"path": path, "content": ""}, action_key="write_file")
+                if ok:
+                    return mcp_out or f"Saved file `{os.path.basename(path)}`."
+            out = self._write_text_file(path, "", append=False)
+            self._record_file_route_result("write_file", "local", False if str(out).lower().startswith("could not") else True, error_text=str(out))
+            return out
 
         m = re.match(r"^(?:write|overwrite|replace)\s+(?:to\s+)?file\s+(.+?)\s*[:\-]\s*(.+)$", text, flags=re.IGNORECASE)
         if m:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
-            return self._write_text_file(path, m.group(2), append=False)
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
+            if self._prefer_mcp_for_action("write_file"):
+                payload = (m.group(2) or "").replace("\\n", "\n").replace("\\t", "\t")
+                ok, mcp_out = self._mcp_call_filesystem_tool("write_file", {"path": path, "content": payload}, action_key="write_file")
+                if ok:
+                    return mcp_out or f"Updated file `{os.path.basename(path)}`."
+            out = self._write_text_file(path, m.group(2), append=False)
+            self._record_file_route_result("write_file", "local", False if str(out).lower().startswith("could not") else True, error_text=str(out))
+            return out
 
         m = re.match(r"^(?:append|add)\s+(?:to\s+)?file\s+(.+?)\s*[:\-]\s*(.+)$", text, flags=re.IGNORECASE)
         if m:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
-            return self._write_text_file(path, m.group(2), append=True)
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
+            if self._prefer_mcp_for_action("write_file"):
+                add_text = (m.group(2) or "").replace("\\n", "\n").replace("\\t", "\t")
+                ok_read, prior = self._mcp_call_filesystem_tool("read_text_file", {"path": path}, action_key="write_file")
+                combined = ((prior + "\n") if (ok_read and prior) else "") + add_text
+                ok_write, mcp_out = self._mcp_call_filesystem_tool("write_file", {"path": path, "content": combined}, action_key="write_file")
+                if ok_write:
+                    return mcp_out or f"Updated file `{os.path.basename(path)}`."
+            out = self._write_text_file(path, m.group(2), append=True)
+            self._record_file_route_result("write_file", "local", False if str(out).lower().startswith("could not") else True, error_text=str(out))
+            return out
 
         m = re.match(r"^(?:delete|remove)\s+(?:file|folder|directory)?\s*(.+)$", text, flags=re.IGNORECASE)
         if m:
             path, err = self._resolve_workspace_path(m.group(1), allow_desktop=allow_desktop)
             if err:
                 return err
+            guard = _outside_write_guard(path)
+            if guard:
+                return guard
             if not os.path.exists(path):
+                self._record_file_route_result("delete_path", "local", False, error_text="path not found")
                 return "Path not found."
             try:
                 fname = os.path.basename(path)
                 location = "Desktop" if os.path.normcase(os.path.dirname(path)) == os.path.normcase(self.desktop_root) else os.path.dirname(path)
                 if os.path.isdir(path):
                     shutil.rmtree(path)
+                    self._record_file_route_result("delete_path", "local", True)
                     return f"**Deleted** folder `{fname}` from {location}."
                 os.remove(path)
+                self._record_file_route_result("delete_path", "local", True)
                 return f"**Deleted** file `{fname}` from {location}."
             except PermissionError as e:
                 if getattr(e, "winerror", None) == 32:
                     fname = os.path.basename(path)
-                    return f"Cannot delete `{fname}` â it is open in another program. Please close it first, then try again."
+                    self._record_file_route_result("delete_path", "local", False, error_text="file in use")
+                    return f"Cannot delete `{fname}` - it is open in another program. Please close it first, then try again."
+                self._record_file_route_result("delete_path", "local", False, error_text=str(e))
                 return f"Could not delete: {e}"
             except Exception as e:
+                self._record_file_route_result("delete_path", "local", False, error_text=str(e))
                 return f"Could not delete path: {e}"
 
         def _friendly_path(p):
@@ -10250,15 +13562,26 @@ class WindowsAgent:
                 dst, err = self._resolve_workspace_path(new_name, allow_desktop=allow_desktop)
                 if err:
                     return err
+            guard = _outside_write_guard(dst)
+            if guard:
+                return guard
             if not os.path.exists(src):
+                self._record_file_route_result("move_file", "local", False, error_text="source not found")
                 return f"Could not find `{os.path.basename(src)}`."
             if os.path.exists(dst):
+                self._record_file_route_result("move_file", "local", False, error_text="destination exists")
                 return f"`{os.path.basename(dst)}` already exists."
+            if self._prefer_mcp_for_action("move_file"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("move_file", {"source": src, "destination": dst}, action_key="move_file")
+                if ok:
+                    return mcp_out or f"Renamed to `{os.path.basename(dst)}`."
             try:
                 os.rename(src, dst)
                 kind = "Folder" if os.path.isdir(dst) else "File"
+                self._record_file_route_result("move_file", "local", True)
                 return f"**{kind} renamed:** `{os.path.basename(src)}` ? `{os.path.basename(dst)}` on {_friendly_path(os.path.dirname(dst))}."
             except Exception as e:
+                self._record_file_route_result("move_file", "local", False, error_text=str(e))
                 return f"Could not rename: {e}"
 
         m = re.match(r"^(?:move)\s+(?:file|folder|directory)?\s*(.+?)\s+to\s+(.+)$", text, flags=re.IGNORECASE)
@@ -10280,14 +13603,24 @@ class WindowsAgent:
                 dst, err = self._resolve_workspace_path(dst_raw, allow_desktop=allow_desktop)
                 if err:
                     return err
+            guard = _outside_write_guard(dst)
+            if guard:
+                return guard
             if not os.path.exists(src):
+                self._record_file_route_result("move_file", "local", False, error_text="source not found")
                 return f"Could not find `{os.path.basename(src)}`."
+            if self._prefer_mcp_for_action("move_file"):
+                ok, mcp_out = self._mcp_call_filesystem_tool("move_file", {"source": src, "destination": dst}, action_key="move_file")
+                if ok:
+                    return mcp_out or f"Moved to `{os.path.basename(dst)}`."
             try:
                 os.makedirs(os.path.dirname(dst), exist_ok=True)
                 shutil.move(src, dst)
                 kind = "Folder" if os.path.isdir(dst) else "File"
+                self._record_file_route_result("move_file", "local", True)
                 return f"**{kind} moved:** `{os.path.basename(src)}` ? {_friendly_path(dst)}."
             except Exception as e:
+                self._record_file_route_result("move_file", "local", False, error_text=str(e))
                 return f"Could not move: {e}"
 
         m = re.match(r"^(?:copy)\s+(?:file|folder|directory)?\s*(.+?)\s+to\s+(.+)$", text, flags=re.IGNORECASE)
@@ -10298,9 +13631,14 @@ class WindowsAgent:
             dst, err = self._resolve_workspace_path(m.group(2), allow_desktop=allow_desktop)
             if err:
                 return err
+            guard = _outside_write_guard(dst)
+            if guard:
+                return guard
             if not os.path.exists(src):
+                self._record_file_route_result("copy_file", "local", False, error_text="source not found")
                 return "Source path not found."
             if os.path.exists(dst):
+                self._record_file_route_result("copy_file", "local", False, error_text="destination exists")
                 return "Destination already exists."
             try:
                 os.makedirs(os.path.dirname(dst) or self.workspace_root, exist_ok=True)
@@ -10310,9 +13648,48 @@ class WindowsAgent:
                 else:
                     shutil.copy2(src, dst)
                     kind = "file"
+                self._record_file_route_result("copy_file", "local", True)
                 return f"Copied {kind}: {os.path.relpath(src, self.workspace_root)} -> {os.path.relpath(dst, self.workspace_root)}"
             except Exception as e:
+                self._record_file_route_result("copy_file", "local", False, error_text=str(e))
                 return f"Could not copy path: {e}"
+
+        m = re.match(r"^(?:search|find)\s+files?\s+(?:for\s+)?(.+?)(?:\s+in\s+(.+))?$", text, flags=re.IGNORECASE)
+        if m:
+            pattern = (m.group(1) or "").strip()
+            folder, err = self._resolve_workspace_path((m.group(2) or ".").strip(), allow_desktop=allow_desktop)
+            if err:
+                return err
+            if self._prefer_mcp_for_action("search_files"):
+                ok, mcp_out = self._mcp_call_filesystem_tool(
+                    "search_files",
+                    {"path": folder, "pattern": pattern},
+                    action_key="search_files",
+                )
+                if ok and mcp_out:
+                    return f"Search results for `{pattern}` (via MCP):\n{mcp_out}"
+            if not os.path.isdir(folder):
+                self._record_file_route_result("search_files", "local", False, error_text="folder not found")
+                return "Folder not found."
+            hits = []
+            needle = pattern.lower()
+            for root, dirs, files in os.walk(folder):
+                for n in dirs + files:
+                    if needle in n.lower():
+                        hits.append(os.path.join(root, n))
+                if len(hits) >= 80:
+                    break
+            if not hits:
+                self._record_file_route_result("search_files", "local", True)
+                return f"No matches for `{pattern}`."
+            lines = []
+            for h in hits[:80]:
+                try:
+                    lines.append(f"- {os.path.relpath(h, self.workspace_root)}")
+                except Exception:
+                    lines.append(f"- {h}")
+            self._record_file_route_result("search_files", "local", True)
+            return f"Search results for `{pattern}`:\n" + "\n".join(lines)
 
         return None
 
@@ -10385,7 +13762,7 @@ class WindowsAgent:
             if folder_name:
                 return f"create folder {self.desktop_root}\\{folder_name}"
 
-        # Unified desktop file creation â handles all natural content phrasings
+        # Unified desktop file creation Ã¢Â€Â” handles all natural content phrasings
         # Pattern A: "create file on desktop called X ..."
         # Pattern B: "create file called X on desktop ..."
         # Supports: txt/doc/any extension; auto-adds .txt when no extension given
@@ -10441,7 +13818,7 @@ class WindowsAgent:
                 content_m = _CONTENT_SEP.match(" " + after_desktop)
                 content = after_desktop[content_m.end() - 1:].strip() if content_m else after_desktop
             else:
-                # Content might be embedded in name_part â try splitting there too
+                # Content might be embedded in name_part Ã¢Â€Â” try splitting there too
                 parts = _CONTENT_SEP.split(name_part, maxsplit=1)
                 name_part = parts[0].strip(" \"'`.,")
                 content = parts[1].strip() if len(parts) > 1 else ""
@@ -10467,7 +13844,7 @@ class WindowsAgent:
             if target:
                 return f"delete {self.desktop_root}\\{target}"
 
-        # Example: "remove X folder" / "delete X" â infer Desktop item by name
+        # Example: "remove X folder" / "delete X" Ã¢Â€Â” infer Desktop item by name
         m = re.match(r"^(?:delete|remove)\s+(.+)$", raw, flags=re.IGNORECASE)
         if m and "desktop" not in lower:
             target = _clean_delete_target((m.group(1) or "").strip(" \"'`.,"))
@@ -10477,7 +13854,7 @@ class WindowsAgent:
                     return f"delete {desktop_match}"
 
         def _looks_absolute(s):
-            """True if s is already a resolved Windows absolute path â skip re-resolution."""
+            """True if s is already a resolved Windows absolute path Ã¢Â€Â” skip re-resolution."""
             return bool(s and ((len(s) > 2 and s[1] == ":") or s.startswith(("\\\\"))))
 
         # -- Rename -------------------------------------------------------------
@@ -10495,7 +13872,7 @@ class WindowsAgent:
             """Extract the actual filename from destination, stripping quoted commentary."""
             raw_dst = (raw_dst or "").strip()
             if raw_dst and raw_dst[0] in ('"', "'"):
-                # Whole name is quoted â strip surrounding quotes
+                # Whole name is quoted Ã¢Â€Â” strip surrounding quotes
                 return raw_dst.strip("\"'`.,").strip()
             # Strip trailing quoted commentary: e.g. 'pad1 "All right."' ? 'pad1'
             raw_dst = re.sub(r'\s+["\'].+$', '', raw_dst).strip()
@@ -10510,7 +13887,7 @@ class WindowsAgent:
             m = pat.match(raw)
             if m:
                 src = m.group(1).strip(" \"'`.,")
-                # Already canonical (absolute path) â use as-is, no fuzzy resolution
+                # Already canonical (absolute path) Ã¢Â€Â” use as-is, no fuzzy resolution
                 if _looks_absolute(src):
                     dst = _clean_target_name(m.group(2))
                     if dst:
@@ -10534,7 +13911,7 @@ class WindowsAgent:
             if m:
                 src = m.group(1).strip(" \"'`.,")
                 if _looks_absolute(src):
-                    # Already absolute â use as-is, only resolve destination
+                    # Already absolute Ã¢Â€Â” use as-is, only resolve destination
                     dst_raw = _clean_target_name(m.group(2))
                     dst_raw = re.sub(r"\s+(?:folder|file|directory)s?\s*$", "", dst_raw, flags=re.IGNORECASE).strip(" \"'`.,")
                     if src and dst_raw:
@@ -10567,7 +13944,7 @@ class WindowsAgent:
             return target == desktop_norm
         if re.search(r"\b(list|show|see|what(?:'s| is)|give me)\b", t) and "desktop" in t:
             return True
-        # Reading file content is read-only â no mutation required
+        # Reading file content is read-only Ã¢Â€Â” no mutation required
         if t.startswith("read file "):
             return True
         return False
@@ -10665,10 +14042,28 @@ class WindowsAgent:
         except Exception:
             return False
 
+    # Destinations that start with these prepositions are descriptive geographic
+    # phrases extracted from conversational sentences, never actual website targets.
+    _NAV_PREPOSITION_RE = re.compile(
+        r"^(in|at|near|on|around|by|from|between|across|over|through|within|about|for|with|of)\b",
+        re.IGNORECASE,
+    )
+
     def _extract_navigation_intent(self, raw_input):
         """Parse natural navigation requests like 'go to gmail on firefox'."""
         text = (raw_input or "").strip()
         lowered = text.lower()
+        # Never treat conversational sentences as navigation commands.
+        # "visit" often appears mid-sentence in questions/suggestions and is NOT
+        # a navigation verb in those contexts.
+        if re.match(
+            r"^(where|what|who|when|why|how"
+            r"|give|tell|show|suggest|recommend|list|provide|find\s+me"
+            r"|can\s+you|could\s+you|i\s+need|i\s+want|i\s+would"
+            r"|help|please\s+(?:give|show|tell|suggest|find))\b",
+            lowered,
+        ):
+            return None, None
         # Case: "open google and go to gmail"
         m = re.search(
             r"\bopen\s+(.+?)\s+(?:and\s+)?(?:go to|navigate to|visit)\s+(.+?)(?:\s+on\s+(.+))?$",
@@ -10678,15 +14073,17 @@ class WindowsAgent:
             browser = (m.group(1) or "").strip(" ,.?")
             destination = (m.group(2) or "").strip(" ,.?")
             explicit_browser = (m.group(3) or "").strip(" ,.?")
-            if destination:
+            if destination and not self._NAV_PREPOSITION_RE.match(destination):
                 return destination, explicit_browser or browser
 
-        # Case: "... go to gmail on google" anywhere in sentence
-        m = re.search(r"\b(?:go to|navigate to|visit)\s+(.+?)(?:\s+on\s+(.+))?\s*$", lowered)
+        # Case: "go to gmail on google" / "visit youtube"
+        # Use re.search so "I want to go to youtube" still works, but reject destinations
+        # that are clearly geographic/descriptive phrases (start with a preposition).
+        m = re.search(r"\b(?:go\s+to|navigate\s+to|visit)\s+(.+?)(?:\s+on\s+(.+))?\s*$", lowered)
         if m:
             destination = (m.group(1) or "").strip(" ,.?")
             browser = (m.group(2) or "").strip(" ,.?")
-            if destination:
+            if destination and not self._NAV_PREPOSITION_RE.match(destination):
                 return destination, browser
 
         # Case: "open gmail on firefox" used as navigation
@@ -10694,13 +14091,13 @@ class WindowsAgent:
         if m:
             destination = (m.group(1) or "").strip(" ,.?")
             browser = (m.group(2) or "").strip(" ,.?")
-            if destination:
+            if destination and not self._NAV_PREPOSITION_RE.match(destination):
                 return destination, browser
         return None, None
 
     @staticmethod
     def _strip_ai_sources(text):
-        """Remove any Sources / References section the AI appended â we add our own clean footer."""
+        """Remove any Sources / References section the AI appended Ã¢Â€Â” we add our own clean footer."""
         if not text:
             return text
         # Match "Sources:", "## Sources", "References:", "---\nSources", etc. near end of response
@@ -10733,66 +14130,147 @@ class WindowsAgent:
         if not provider_order:
             self._set_ai_runtime(provider="none", model="none", status="error", error="no_provider_configured")
             raise RuntimeError(
-                "No AI provider configured. Set GROQ_API_KEY and/or DEEPSEEK_API_KEY and/or "
+                "No AI provider configured. Set OPENAI_COMPAT_BASE_URL (+ OPENAI_COMPAT_API_KEY unless local), "
+                "and/or ANTHROPIC_API_KEY and/or GROQ_API_KEY and/or DEEPSEEK_API_KEY and/or "
                 "ALIBABA_MODEL_STUDIO_API_KEY (or DASHSCOPE_API_KEY) and/or GEMINI_API_KEY (or GOOGLE_API_KEY)."
             )
 
         for provider in provider_order:
+            if provider in {"anthropic", "claude"}:
+                models = [self.anthropic_model] + [m for m in self.anthropic_fallback_models if m != self.anthropic_model]
+                for model_name in models:
+                    _t0 = time.time()
+                    try:
+                        answer = self._retry_invoke(
+                            lambda: self._call_anthropic_chat(messages, model_name),
+                            self.ai_max_retries,
+                        )
+                        if (answer or "").strip():
+                            self._record_provider_result("anthropic", True, latency_ms=(time.time() - _t0) * 1000.0)
+                            self._set_cached_ai_response(cache_key, answer.strip())
+                            self._set_ai_runtime(provider="anthropic", model=model_name, status="ok", error="")
+                            return answer.strip()
+                    except Exception as e:
+                        self._record_provider_result("anthropic", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
+                        last_error = e
+            if provider in {"openai_compatible", "openai-compatible", "openai", "ollama", "openrouter"}:
+                models = [self.openai_compat_model] + [m for m in self.openai_compat_fallback_models if m != self.openai_compat_model]
+                for model_name in models:
+                    _t0 = time.time()
+                    try:
+                        answer = self._retry_invoke(
+                            lambda: self._call_openai_compatible_chat(messages, model_name),
+                            self.ai_max_retries,
+                        )
+                        if (answer or "").strip():
+                            self._record_provider_result("openai_compatible", True, latency_ms=(time.time() - _t0) * 1000.0)
+                            self._set_cached_ai_response(cache_key, answer.strip())
+                            self._set_ai_runtime(provider="openai_compatible", model=model_name, status="ok", error="")
+                            return answer.strip()
+                    except Exception as e:
+                        self._record_provider_result("openai_compatible", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
+                        last_error = e
             if provider in {"gemini", "google"}:
                 models = [self.gemini_model] + [m for m in self.gemini_fallback_models if m != self.gemini_model]
                 for model_name in models:
+                    _t0 = time.time()
                     try:
                         answer = self._retry_invoke(
                             lambda: self._call_gemini_chat(messages, model_name),
                             self.ai_max_retries,
                         )
                         if (answer or "").strip():
+                            self._record_provider_result("gemini", True, latency_ms=(time.time() - _t0) * 1000.0)
                             self._set_cached_ai_response(cache_key, answer.strip())
                             self._set_ai_runtime(provider="gemini", model=model_name, status="ok", error="")
                             return answer.strip()
                     except Exception as e:
+                        self._record_provider_result("gemini", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
                         last_error = e
             if provider in {"qwen", "alibaba", "dashscope"}:
                 models = [self.qwen_model] + [m for m in self.qwen_fallback_models if m != self.qwen_model]
                 for model_name in models:
+                    _t0 = time.time()
                     try:
                         answer = self._retry_invoke(
                             lambda: self._call_qwen_chat(messages, model_name),
                             self.ai_max_retries,
                         )
                         if (answer or "").strip():
+                            self._record_provider_result("qwen", True, latency_ms=(time.time() - _t0) * 1000.0)
                             self._set_cached_ai_response(cache_key, answer.strip())
                             self._set_ai_runtime(provider="qwen", model=model_name, status="ok", error="")
                             return answer.strip()
                     except Exception as e:
+                        self._record_provider_result("qwen", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
                         last_error = e
             if provider == "deepseek":
                 models = [self.deepseek_model] + [m for m in self.deepseek_fallback_models if m != self.deepseek_model]
                 for model_name in models:
+                    _t0 = time.time()
                     try:
                         answer = self._retry_invoke(
                             lambda: self._call_deepseek_chat(messages, model_name),
                             self.ai_max_retries,
                         )
                         if (answer or "").strip():
+                            self._record_provider_result("deepseek", True, latency_ms=(time.time() - _t0) * 1000.0)
                             self._set_cached_ai_response(cache_key, answer.strip())
                             self._set_ai_runtime(provider="deepseek", model=model_name, status="ok", error="")
                             return answer.strip()
                     except Exception as e:
+                        self._record_provider_result("deepseek", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
                         last_error = e
             elif provider == "groq":
                 models = [self.groq_model] + [m for m in self.groq_fallback_models if m != self.groq_model]
                 for model_name in models:
+                    _t0 = time.time()
                     try:
                         answer = self._retry_invoke(
                             lambda: self._call_groq_chat(messages, model_name),
                             self.ai_max_retries,
                         )
                         if (answer or "").strip():
+                            self._record_provider_result("groq", True, latency_ms=(time.time() - _t0) * 1000.0)
                             self._set_cached_ai_response(cache_key, answer.strip())
                             self._set_ai_runtime(provider="groq", model=model_name, status="ok", error="")
                             return answer.strip()
                     except Exception as e:
+                        self._record_provider_result("groq", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
+                        last_error = e
+            elif provider == "glm":
+                models = [self.glm_model] + [m for m in self.glm_fallback_models if m != self.glm_model]
+                for model_name in models:
+                    _t0 = time.time()
+                    try:
+                        answer = self._retry_invoke(
+                            lambda: self._call_glm_chat(messages, model_name),
+                            self.ai_max_retries,
+                        )
+                        if (answer or "").strip():
+                            self._record_provider_result("glm", True, latency_ms=(time.time() - _t0) * 1000.0)
+                            self._set_cached_ai_response(cache_key, answer.strip())
+                            self._set_ai_runtime(provider="glm", model=model_name, status="ok", error="")
+                            return answer.strip()
+                    except Exception as e:
+                        self._record_provider_result("glm", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
+                        last_error = e
+            elif provider == "mimo":
+                models = [self.mimo_model] + [m for m in self.mimo_fallback_models if m != self.mimo_model]
+                for model_name in models:
+                    _t0 = time.time()
+                    try:
+                        answer = self._retry_invoke(
+                            lambda: self._call_mimo_chat(messages, model_name),
+                            self.ai_max_retries,
+                        )
+                        if (answer or "").strip():
+                            self._record_provider_result("mimo", True, latency_ms=(time.time() - _t0) * 1000.0)
+                            self._set_cached_ai_response(cache_key, answer.strip())
+                            self._set_ai_runtime(provider="mimo", model=model_name, status="ok", error="")
+                            return answer.strip()
+                    except Exception as e:
+                        self._record_provider_result("mimo", False, latency_ms=(time.time() - _t0) * 1000.0, error_text=str(e))
                         last_error = e
         self._set_ai_runtime(provider="fallback", model="n/a", status="error", error=last_error)
         raise RuntimeError(f"AI request failed: {last_error}")
@@ -10822,10 +14300,10 @@ class WindowsAgent:
 
         payload = []
         prompt = (
-            "You are a live screen analyst. The user is sharing their Windows desktop with you in real time â like a screen share call.\n"
+            "You are a live screen analyst. The user is sharing their Windows desktop with you in real time Ã¢Â€Â” like a screen share call.\n"
             "Give a detailed, structured analysis exactly like this format:\n\n"
             "??? Active App Overview\n"
-            "- Foreground App: [app name], [what it's showing â page title, file name, URL, content summary]\n"
+            "- Foreground App: [app name], [what it's showing Ã¢Â€Â” page title, file name, URL, content summary]\n"
             "- Other visible app: [if any visible in background]\n\n"
             "?? App Layout & Activity\n"
             "- Taskbar Apps (list every icon/app visible in the taskbar): ...\n"
@@ -10838,8 +14316,8 @@ class WindowsAgent:
             "- OS/theme: ...\n"
             "- What the user appears to be working on or doing right now\n"
             "- Any errors, warnings, or issues visible on screen\n\n"
-            "IMPORTANT â Opuntia window recognition: you may see a floating translucent chat window or a small panel "
-            "with a text input box and a green 'Live' or 'Live off' button â this IS the Opuntia AI assistant's own "
+            "IMPORTANT Ã¢Â€Â” Opuntia window recognition: you may see a floating translucent chat window or a small panel "
+            "with a text input box and a green 'Live' or 'Live off' button Ã¢Â€Â” this IS the Opuntia AI assistant's own "
             "chat interface. Always refer to it as 'Opuntia chat window' (not 'a popup', 'a dialog', or 'unknown window').\n"
             "Be factual and precise. Read all visible text exactly as written. Do not guess or fabricate values.\n"
             "If something is unreadable, say 'unreadable' rather than guessing.\n"
@@ -10855,7 +14333,7 @@ class WindowsAgent:
                     w, h = rgb.size
                     views = [rgb]
                     if self.screen_vision_detail_mode in {"high", "max"} and (not self.screen_vision_fast_mode) and w > 300 and h > 300:
-                        # Center crop â main content area
+                        # Center crop Ã¢Â€Â” main content area
                         cx, cy = w // 2, h // 2
                         cw, ch = int(w * 0.65), int(h * 0.65)
                         l = max(0, cx - cw // 2)
@@ -10863,9 +14341,9 @@ class WindowsAgent:
                         r = min(w, l + cw)
                         b = min(h, t + ch)
                         views.append(rgb.crop((l, t, r, b)))
-                        # Top strip â menus, tabs, address bars, title bars
+                        # Top strip Ã¢Â€Â” menus, tabs, address bars, title bars
                         views.append(rgb.crop((0, 0, w, max(220, int(h * 0.28)))))
-                        # Bottom strip â taskbar, status bars, notifications
+                        # Bottom strip Ã¢Â€Â” taskbar, status bars, notifications
                         views.append(rgb.crop((0, max(0, h - max(80, int(h * 0.12))), w, h)))
                     for idx, view in enumerate(views):
                         fmt = "PNG" if idx == 0 else "JPEG"
@@ -11257,6 +14735,136 @@ class WindowsAgent:
             return f"Attachment analysis failed: {e}"
 
     def process_command(self, user_input):
+        # ── HARD GUARD: open/browse + URL must NEVER reach doc-creation handlers ──
+        _raw_stripped = (user_input or "").strip()
+        # Strip mode prefixes before checking
+        for _pfx in ("MODE_TASK::", "AUTH_OK::", "SCREEN_SHARE::"):
+            if _raw_stripped.startswith(_pfx):
+                _raw_stripped = _raw_stripped[len(_pfx):]
+        # Strip surrounding quotes and trailing punctuation added by voice transcription
+        # e.g. '"Scroll down."' → 'Scroll down'  /  '"Click on login"' → 'Click on login'
+        _raw_stripped = _raw_stripped.strip('"\'').rstrip('.!?,;')
+        _url_open_m = re.match(
+            r'^(?:run|play|open|browse|visit|go\s+to|navigate\s+to|load|show\s+me|fetch)\s+(https?://\S+|www\.\S+)',
+            _raw_stripped.strip(), re.IGNORECASE,
+        )
+        if not _url_open_m:
+            # Also catch bare URL pasted alone
+            _url_open_m = re.match(r'^(https?://\S+)\s*$', _raw_stripped.strip(), re.IGNORECASE)
+        if _url_open_m:
+            _target_url = _url_open_m.group(1).rstrip('.,;!?)')
+            if not _target_url.startswith("http"):
+                _target_url = "https://" + _target_url
+            # Always open in Playwright so the user can continue giving commands inside the page
+            if sync_playwright is not None:
+                try:
+                    return self._pw_navigate(_target_url)
+                except Exception:
+                    pass
+            # Fallback: system browser
+            try:
+                if self._open_url_in_browser(_target_url, None):
+                    return f"Opened {_target_url} in your default browser."
+                import webbrowser as _wb
+                _wb.open(_target_url)
+                return f"Opened {_target_url}."
+            except Exception:
+                return f"Could not open {_target_url}."
+
+        # ── Playwright autonomous intelligence block ──────────────────────────────
+        # When browser is active, a wide range of natural language commands work:
+        # explain, translate, summarize, copy, open folders, ask questions about page, etc.
+        if sync_playwright is not None and self._pw_page is not None:
+            _pw_low = _raw_stripped.lower()
+
+            # ── Navigation / mechanical actions first (fast path) ────────────────
+            _pw_result = self._pw_automate(_raw_stripped)
+            if _pw_result is not None:
+                return _pw_result
+
+            # "open [folder/link/item]" → try clicking it in the browser
+            _pw_open_m = re.match(r'^open\s+(?:the\s+)?(.+)$', _pw_low)
+            if _pw_open_m and not re.search(r'https?://', _raw_stripped):
+                _target = _pw_open_m.group(1).strip(' "\'.,')
+                try:
+                    _pw_click_result = self._pw_send("click", _target)
+                    if "Could not find" not in _pw_click_result:
+                        return _pw_click_result
+                except Exception:
+                    pass
+
+            # ── Full autonomous Playwright intelligence ───────────────────────
+            # Everything that isn't a direct mechanical command goes to the LLM
+            # with full page context + playwright capabilities listed in system prompt.
+            # Uses a 15-second cache so only the FIRST command after a page load
+            # pays the JS-evaluation cost — subsequent commands are instant.
+            try:
+                _now = time.time()
+                if self._pw_page_cache and (_now - self._pw_page_cache_ts) < 15.0:
+                    _page_text = self._pw_page_cache.get("text", "")
+                    _page_scan = self._pw_page_cache.get("scan", "")
+                    _cur_url   = self._pw_page_cache.get("url", "")
+                    _cur_title = self._pw_page_cache.get("title", "")
+                else:
+                    # Single queue round-trip instead of 4 separate calls
+                    _ctx = self._pw_send("full_context")
+                    if isinstance(_ctx, dict):
+                        _page_text = _ctx.get("text", "")
+                        _page_scan = _ctx.get("scan", "")
+                        _cur_url   = _ctx.get("url", "")
+                        _cur_title = _ctx.get("title", "")
+                    else:
+                        _page_text = _page_scan = _cur_url = _cur_title = ""
+                    self._pw_page_cache = {"text": _page_text, "scan": _page_scan,
+                                           "url": _cur_url, "title": _cur_title}
+                    self._pw_page_cache_ts = _now
+            except Exception:
+                _page_text = _page_scan = _cur_url = _cur_title = ""
+
+            _PW_SYSTEM = (
+                "You are Opuntia, an autonomous AI agent currently operating in **Playwright Browser Mode**.\n"
+                "You have FULL programmatic control over the web browser the user sees on the right panel.\n\n"
+                "## What you can do RIGHT NOW (just say it naturally):\n"
+                "- **Navigate**: `play https://...` or `go to example.com`\n"
+                "- **Click**: `click on Sign In`, `click the search icon`\n"
+                "- **Type / Fill forms**: `type hello@email.com into the email field`, `write Claude into the search box`\n"
+                "- **Scroll**: `scroll down`, `go to the bottom`, `scroll up 500`\n"
+                "- **Screenshot**: `screenshot`, `full page screenshot`, `screenshot of element .header`\n"
+                "- **Scrape data**: `read page`, `scan page`, `extract all links`, `copy the table`\n"
+                "- **Keyboard shortcuts**: `press Enter`, `ctrl+a`, `select all`, `copy`, `paste`\n"
+                "- **Multi-step tasks**: just describe what you want achieved — I break it into steps and execute\n"
+                "- **Translate / Explain**: `translate this paragraph to Arabic`, `explain the installation section`\n"
+                "- **Network inspection**: `intercept requests`, `show intercepted requests`\n"
+                "- **Video recording**: `start recording`, `stop recording`\n"
+                "- **Run JavaScript**: `run js document.title`\n"
+                "- **Switch browser**: `use firefox`, `use webkit`\n"
+                "- **Wait**: `wait for Login button`, `wait for page to load`\n"
+                "- **Close**: `close browser`\n\n"
+                "## Current browser state:\n"
+                f"- URL: {_cur_url}\n"
+                f"- Title: {_cur_title}\n\n"
+                "## Page scan (visible interactive elements):\n"
+                f"{str(_page_scan)[:1500]}\n\n"
+                "## Page text content (what the user sees):\n"
+                f"{str(_page_text)[:3500]}\n\n"
+                "## Instructions:\n"
+                "- Answer questions about the page using the content above.\n"
+                "- For multi-step tasks, describe EXACTLY what you are doing step by step.\n"
+                "- For translation/explanation, be direct — return the result immediately.\n"
+                "- For extraction/scraping, format data clearly (markdown table, list, JSON).\n"
+                "- If you need to perform browser actions as part of your answer, state them clearly.\n"
+                "- NEVER say 'I cannot browse the web' — you are IN the browser right now.\n"
+                "- Keep responses concise and action-oriented."
+            )
+            _msgs = [
+                {"role": "system", "content": _PW_SYSTEM},
+                {"role": "user", "content": _raw_stripped},
+            ]
+            try:
+                return self._call_ai(_msgs)
+            except Exception:
+                pass
+
         if not hasattr(self, "pending_question"):
             self.pending_question = None
         if not hasattr(self, "pending_confirmation"):
@@ -11287,7 +14895,7 @@ class WindowsAgent:
         screen_prefix = "SCREEN_SHARE::"
         attach_prefix = "ATTACHMENTS::"
         task_mode_prefix = "MODE_TASK::"
-        # Detect and strip mode prefix — set input_mode accordingly
+        # Detect and strip mode prefix â€” set input_mode accordingly
         _input_mode = getattr(self, "input_mode", "chat")
         if raw_input.startswith(task_mode_prefix):
             raw_input = raw_input[len(task_mode_prefix):]
@@ -11325,10 +14933,14 @@ class WindowsAgent:
                 raw_input = stripped_cmd
         self.screen_sharing_active = bool(shared_screen_path)
         user_input = self._normalize_spoken_typos(raw_input)
+        # Guarded autonomy profiles can relax sensitive confirmations in Task mode.
+        _policy = self._autonomy_policy()
+        if _input_mode == "task" and (not _policy.get("require_sensitive_confirmation", True)):
+            allow_sensitive_fs = True
         self._update_profile_domain(user_input)
         normalized_user_input = self._normalize_intent_text(user_input)
         cmd_lower = normalized_user_input.lower()
-        # Detect large write-body commands early â used by multiple guards below
+        # Detect large write-body commands early Ã¢Â€Â” used by multiple guards below
         _has_write_body = bool(re.search(
             r'\b(write\s+this|write\s+inside|with\s+content|write:|inside\s*:|write\s+in\s+it'
             r'|(?:write|create|save|export|put)\s+what\s+(?:(?:you|u)|(?:have|had)\s+(?:you|u))|write\s+what\s+(?:you|u)\s+have|write\s+the\s+last|write\s+your\s+last'
@@ -11346,7 +14958,7 @@ class WindowsAgent:
         # contains keywords that would hijack routing (e.g. "list", "app", "volume",
         # "sleep", "desktop", "launch", "open", etc.).
         # By stripping the content body from cmd_lower HERE, every routing handler
-        # downstream automatically receives only the command part â no per-handler
+        # downstream automatically receives only the command part Ã¢Â€Â” no per-handler
         # guards needed. user_input (passed to _handle_word_command) is never truncated
         # so content extraction still works correctly.
         _body_split_m = re.search(
@@ -11369,7 +14981,7 @@ class WindowsAgent:
                 self.last_attachment_paths = attachment_paths[:]
                 self.last_attachment_ts = time.time()
         if not attachment_paths:
-            # Don't recall last attachment when user is writing inline content â
+            # Don't recall last attachment when user is writing inline content Ã¢Â€Â”
             # "attached"/"file" inside written content is not a file reference.
             if not _has_write_body and re.search(r"\b(image|photo|picture|this image|attached|attachment|file)\b", cmd_lower):
                 if self.last_attachment_paths and (time.time() - self.last_attachment_ts) < 600:
@@ -11378,26 +14990,18 @@ class WindowsAgent:
             analysis = self._analyze_attachments(attachment_paths, user_input, shared_screen_path=shared_screen_path)
             return analysis
 
-        # ── ULTRA-EARLY FAST-PATH: authorized doc-creation bypasses ALL pending state ──
+        # â”€â”€ ULTRA-EARLY FAST-PATH: authorized doc-creation bypasses ALL pending state â”€â”€
         # When the user has already been shown the UI auth prompt and clicked Allow,
         # allow_sensitive_fs=True. At that point the command MUST go straight to the
         # PDF/Word handler regardless of any leftover pending_question / pending_pdf_save
         # state that could intercept and misroute it.
-        _dbg_log = getattr(self, '_dbg_log', None)
-        if _dbg_log is None:
-            import logging as _logging
-            _dbg_log = _logging.getLogger('opuntia_pdf_debug')
-            _h = _logging.FileHandler(r'C:\Users\Adam Ben Rejeb\Desktop\pdf_debug.log', encoding='utf-8')
-            _h.setFormatter(_logging.Formatter('%(asctime)s %(message)s'))
-            _dbg_log.addHandler(_h)
-            _dbg_log.setLevel(_logging.DEBUG)
-            self._dbg_log = _dbg_log
+        _dbg_log = self._get_pdf_debug_logger()
         _dbg_log.debug(f'process_command: allow_sensitive_fs={allow_sensitive_fs} _has_write_body={_has_write_body} cmd_lower={repr(cmd_lower[:60])}')
         if allow_sensitive_fs:
             _is_close_intent = bool(re.search(r"\b(close|quit|exit|terminate|kill)\b", cmd_lower))
             _is_doc_intent = bool(re.search(r"\b(create|make|write|generate|save|produce|build|export|prepare|draft|give|put|convert|turn)\b", cmd_lower))
             if _is_close_intent and not _is_doc_intent:
-                _dbg_log.debug("  allow_sensitive_fs: close intent detected — skipping doc-creation fast-path")
+                _dbg_log.debug("  allow_sensitive_fs: close intent detected â€” skipping doc-creation fast-path")
             else:
                 _ue_doc = bool(
                     re.search(r'\b(pdf|\.pdf|docx?|\.docx?|word\s+(doc(ument)?|file)|text\s+file|note\s+file|txt\s*file?\b|\.txt|\btxt\b|pptx?|\.pptx?|pow[a-z]*oint|presentation|slides?\b|slide\s+deck|xlsx?|\.xlsx?|excell?|spreadsheet|spread\s+sheet|google\s+sheets?|gsheet)\b', cmd_lower)
@@ -11431,7 +15035,7 @@ class WindowsAgent:
                     _dbg_log.debug(f'  _ue_word={repr(str(_ue_word)[:80]) if _ue_word else None}')
                     if _ue_word is not None:
                         return _ue_word
-                # ── DIRECT FALLBACK: both handlers returned None ───────────────
+                # â”€â”€ DIRECT FALLBACK: both handlers returned None â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
                 # _handle_pdf_command/_handle_word_command failed to handle the
                 # "write what you sent inside PDF" case. Build the PDF directly.
                 _fb_last_pat = re.compile(
@@ -11545,7 +15149,7 @@ class WindowsAgent:
                                 _fb_reply = f"Could not create PDF: {_fb_err}"
                         _dbg_log.debug(f'  FALLBACK reply={repr(str(_fb_reply)[:80])}')
                         return _fb_reply
-                # ── INLINE CONTENT FALLBACK: "write this inside pdf : [content]" ─────
+                # â”€â”€ INLINE CONTENT FALLBACK: "write this inside pdf : [content]" â”€â”€â”€â”€â”€
                 else:
                     _inline_m = re.search(
                         r'(?:write\s*:|inside\s*(?:this\s*)?:|and\s+write\s*:|write\s+(?:this|it|that|inside|content)\s*:|following\s*:|put\s*:|generate\s+\w+\s+inside\s*:)\s*(.+)',
@@ -11642,24 +15246,34 @@ class WindowsAgent:
                         if _fb_reply is not None:
                             _dbg_log.debug(f'  INLINE FALLBACK reply={repr(str(_fb_reply)[:80])}')
                             return _fb_reply
-                # ── BARE COMMAND FALLBACK: "generate a pdf" with no content ──────────
-                # Neither "last response" pattern nor inline content found.
-                # Use the most recent AI response as the document content.
+                # â”€â”€ BARE COMMAND FALLBACK: “generate a pdf” with no content â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+                # STRICT GUARD: only fire when the command explicitly asks for a document.
+                # Must have BOTH a creation verb AND a document type keyword.
+                _bare_has_doc_verb = bool(re.search(
+                    r'\b(generate|create|make|produce|build|export|save|write|give|prepare|draft|put|convert)\b',
+                    cmd_lower,
+                ))
+                _bare_has_doc_type = bool(re.search(
+                    r'\b(pdf|\.pdf|docx?|word|txt|text\s+file|note|pptx?|presentation|xlsx?|spreadsheet)\b',
+                    cmd_lower,
+                ))
+                _bare_has_url = bool(re.search(r'https?://', user_input))
                 _bare_task_hist = list(getattr(self, 'task_conversation_history', []))
                 _bare_hist = _bare_task_hist or list(getattr(self, 'conversation_history', []))
                 _bare_content = ''
-                for _bare_msg in reversed(_bare_hist):
-                    _bare_ai = (_bare_msg.get('assistant') or _bare_msg.get('content') or '').strip()
-                    if _bare_ai:
-                        _bare_content = self._strip_ai_sources(_bare_ai)
-                        break
-                # Only fall back to conversation_history if we used task history and found nothing
-                if not _bare_content and _bare_task_hist:
-                    for _bare_msg in reversed(list(getattr(self, 'conversation_history', []))):
+                if not _bare_has_url and _bare_has_doc_verb and _bare_has_doc_type:
+                    for _bare_msg in reversed(_bare_hist):
                         _bare_ai = (_bare_msg.get('assistant') or _bare_msg.get('content') or '').strip()
                         if _bare_ai:
                             _bare_content = self._strip_ai_sources(_bare_ai)
                             break
+                    # Only fall back to conversation_history if we used task history and found nothing
+                    if not _bare_content and _bare_task_hist:
+                        for _bare_msg in reversed(list(getattr(self, 'conversation_history', []))):
+                            _bare_ai = (_bare_msg.get('assistant') or _bare_msg.get('content') or '').strip()
+                            if _bare_ai:
+                                _bare_content = self._strip_ai_sources(_bare_ai)
+                                break
                 if _bare_content:
                     _dbg_log.debug(f'  BARE CMD FALLBACK: content={repr(_bare_content[:80])}')
                     _bare_desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
@@ -11736,7 +15350,7 @@ class WindowsAgent:
                     if _bare_reply is not None:
                         _dbg_log.debug(f'  BARE CMD FALLBACK reply={repr(str(_bare_reply)[:80])}')
                         return _bare_reply
-        # ── END ULTRA-EARLY FAST-PATH ─────────────────────────────────────────────
+        # â”€â”€ END ULTRA-EARLY FAST-PATH â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         # -- Confirmation handlers MUST run before smalltalk so "yeah/ok/sure/1/2" work --
         if self.pending_question is not None:
@@ -11771,7 +15385,7 @@ class WindowsAgent:
             return "Please answer yes or no."
 
         # -- Pending doc save location -----------------------------------------
-        # Opuntia asked "where to save?" â the user's entire next message is the answer.
+        # Opuntia asked "where to save?" Ã¢Â€Â” the user's entire next message is the answer.
         # Doc is created DIRECTLY at the final path (no temp file, no WinError 32).
         if self._pending_pdf_save is not None:
             pending = self._pending_pdf_save
@@ -11781,7 +15395,7 @@ class WindowsAgent:
             doc_title = pending.get("doc_title", "")
             folder, err = self._parse_save_location(user_input)
             if err == "cancelled":
-                return "Discarded â PDF was not saved."
+                return "Discarded Ã¢Â€Â” PDF was not saved."
             if err:
                 _cmd_verbs = re.compile(
                     r"^(write|create|make|open|close|search|find|show|tell|what|who|how|can|do|go|get|send|save|delete|list|help|yo|hi|hello)\b",
@@ -11814,7 +15428,7 @@ class WindowsAgent:
             doc_title = pending.get("doc_title", "")
             folder, err = self._parse_save_location(user_input)
             if err == "cancelled":
-                return "Discarded â document was not saved."
+                return "Discarded Ã¢Â€Â” document was not saved."
             if err:
                 # If the user sent a new command instead of a location, discard the
                 # pending save silently and fall through to normal command routing.
@@ -11823,12 +15437,12 @@ class WindowsAgent:
                     re.IGNORECASE,
                 )
                 if not _cmd_verbs.match(user_input.strip()):
-                    # Not a command â re-ask once
+                    # Not a command Ã¢Â€Â” re-ask once
                     self._pending_doc_save = pending
                     return f"{err}\nWhere do you want to save **`{doc_name}`**? (desktop / documents / D drive / full path)"
-                # Looks like a new command â fall through to normal routing below
+                # Looks like a new command Ã¢Â€Â” fall through to normal routing below
             else:
-                # Valid save location â create the doc
+                # Valid save location Ã¢Â€Â” create the doc
                 try:
                     os.makedirs(folder, exist_ok=True)
                 except Exception:
@@ -11844,22 +15458,134 @@ class WindowsAgent:
                     pass
                 return f"**Saved and opened** `{doc_name}` in `{folder}`"
 
-        # -- Smalltalk (only when no pending confirmation) ----------------------
-        # In Task mode: skip smalltalk — interpret everything as a task attempt
-        if _input_mode != "task" and self._is_smalltalk_query(cmd_lower):
+        # -- User city setting ("my city is X" / "I live in X" / "set my city to X") --
+        _city_set_m = re.match(
+            r"^\s*(?:my\s+(?:city|location|home(?:\s+city)?|town)\s+is|i\s+live\s+in|i(?:'m|\s+am)\s+(?:from|in)|set\s+my\s+(?:city|location)\s+(?:to|as))\s+(.+?)\s*[.!?]*\s*$",
+            cmd_lower,
+        )
+        if _city_set_m:
+            new_city = user_input[_city_set_m.start(1):_city_set_m.end(1)].strip().title()
+            self.user_city = new_city
+            self._save_settings()
+            return f"Got it — I'll show **{new_city}** in the greeting from now on."
+
+        # -- Smalltalk (works in both chat and task mode) -----------------------
+        if self._is_smalltalk_query(cmd_lower):
             if re.search(r"\b(hru|how\s+r\s+u|how\s+are\s+u|how\s+are\s+you|how\s+u)\b", cmd_lower):
                 return "I'm good and ready to help. What do you need?"
+            # Acknowledgements after a substantive reply ("great", "nice", "ok", "cool", etc.)
+            # should feel natural, not restart with a cold "Hello. How can I help?".
+            # Route them to the LLM so it can respond with conversation context.
+            if re.search(
+                r"^\s*(thanks|thank\s+you|thank\s+u|thx|ty|ok|okay|cool|nice|great|"
+                r"got\s+it|understood|perfect|awesome|noted|appreciate|alright|sure)\s*[!.,?]*\s*$",
+                cmd_lower, re.IGNORECASE,
+            ):
+                return self.intelligent_respond(user_input, has_live_screen=bool(shared_screen_path))
             return "Hello. How can I help?"
+
+        def _ret(msg, remember=True):
+            _msg = str(msg or "")
+            self._capture_turn(user_input, _msg, remember=bool(remember))
+            return _msg
 
         if re.match(r"^\s*(execute|run|start)\s+(screen\s+)?plan\s*$", cmd_lower):
             return self._start_plan_execution()
 
         if re.search(r"\b(close|exit|quit|turn off|shutdown)\s+(yourself|this app|the app)\b", cmd_lower):
             return "__APP_EXIT__"
+        if re.match(r"^\s*(ai|llm)\s+(model|models|provider|providers?)\s+(status|stats?)\s*$", cmd_lower):
+            return _ret(self._ai_model_status_text())
+        if re.search(
+            r"\b(what|which)\s+(model|llm|ai)\b.{0,24}\b(you|opuntia)\b|\bmodel\s+used\s+by\s+opuntia\b|\bwhat\s+about\s+the\s+model\s+used\s+by\s+opuntia\b",
+            cmd_lower,
+            flags=re.IGNORECASE,
+        ):
+            return _ret(self._ai_model_status_text())
         if re.match(r"^\s*reload\s+(training|prompt)\s+(prompts?|examples?)\s*$", cmd_lower):
             self.load_prompt_examples()
             self._audit("training_reload", "allowed", {"count": len(self.prompt_examples)})
             return f"Reloaded training prompts ({len(self.prompt_examples)} examples)."
+        if re.match(r"^\s*mcp\s+reload\s*$", cmd_lower):
+            if self.mcp_bridge is None:
+                return _ret("MCP bridge unavailable. Install dependency with: pip install mcp", remember=False)
+            self.mcp_bridge.load_config()
+            self._mcp_allowed_dirs_cache = []
+            self._mcp_allowed_dirs_ts = 0.0
+            return _ret(self._mcp_status_text())
+        if re.match(r"^\s*mcp\s+(status|stats?)\s*$", cmd_lower):
+            return _ret(self._mcp_status_text())
+        if re.match(r"^\s*context\s+(status|stats?)\s*$", cmd_lower):
+            return _ret(self._topic_anchor_status_text())
+        if re.match(r"^\s*context\s+(reset|clear)\s*$", cmd_lower):
+            self._reset_topic_anchor()
+            return _ret("Context anchor reset.")
+        if re.match(r"^\s*mcp\s+servers?\s*$", cmd_lower):
+            return _ret(self._mcp_servers_text())
+        if re.match(r"^\s*mcp\s+routing\s+(status|stats?)\s*$", cmd_lower):
+            return _ret(self._mcp_routing_status_text())
+        _mcp_tools = re.match(r"^\s*mcp\s+tools\s+([a-zA-Z0-9_.-]+)\s*$", user_input, re.IGNORECASE)
+        if _mcp_tools:
+            return _ret(self._mcp_tools_text(_mcp_tools.group(1)))
+        _mcp_call = re.match(
+            r"^\s*mcp\s+call\s+([a-zA-Z0-9_.-]+)\s+([a-zA-Z0-9_.:\-/]+)(?:\s+(.+))?\s*$",
+            user_input,
+            re.IGNORECASE,
+        )
+        if _mcp_call:
+            server_name = (_mcp_call.group(1) or "").strip()
+            tool_name = (_mcp_call.group(2) or "").strip()
+            args_raw = (_mcp_call.group(3) or "").strip()
+            args_obj = {}
+            if args_raw:
+                try:
+                    parsed = json.loads(args_raw)
+                except Exception as e:
+                    return _ret(f"Invalid MCP call JSON args: {e}", remember=False)
+                if not isinstance(parsed, dict):
+                    return _ret("MCP call args must be a JSON object.", remember=False)
+                args_obj = parsed
+            return _ret(self._mcp_call_text(server_name, tool_name, args_obj))
+        if re.match(r"^\s*(ai\s+)?providers?\s+(status|stats?)\s*$", cmd_lower):
+            return self._provider_stats_text()
+        if re.match(r"^\s*(ai\s+)?providers?\s+reset\s*$", cmd_lower):
+            self._reset_provider_stats()
+            return "Provider stats reset."
+        if re.match(r"^\s*(ai\s+)?providers?\s+cooldown\s+clear\s*$", cmd_lower):
+            self.provider_cooldown_until = {}
+            self._save_provider_stats()
+            return "Provider cooldowns cleared."
+        if re.match(r"^\s*autonomy\s+(status|stats?)\s*$", cmd_lower):
+            return self._autonomy_status_text()
+        if re.match(r"^\s*autonomy\s+(safe|balanced|autonomous)\s*$", cmd_lower):
+            mode = re.sub(r"^\s*autonomy\s+", "", cmd_lower).strip()
+            ok, msg = self.set_autonomy_profile(mode, persist=True)
+            return msg
+        if re.match(r"^\s*(plan\s+workflow|workflow\s+plan)\s+.+$", cmd_lower):
+            goal = re.sub(r"^\s*(plan\s+workflow|workflow\s+plan)\s+", "", user_input, flags=re.IGNORECASE).strip()
+            plan = self._build_workflow_plan(goal)
+            steps = plan.get("steps") or []
+            lines = [f"Workflow plan ({len(steps)} steps):"]
+            for i, s in enumerate(steps[:20], start=1):
+                lines.append(f"{i}. {s}")
+            lines.append("Use `run workflow` to execute.")
+            return "\n".join(lines)
+        if re.match(r"^\s*(workflow\s+status|show\s+workflow)\s*$", cmd_lower):
+            plan = self.pending_workflow_plan if isinstance(self.pending_workflow_plan, dict) else None
+            if not plan:
+                return "No pending workflow."
+            steps = plan.get("steps") or []
+            cur = int(plan.get("cursor", 0))
+            return (
+                f"Workflow pending: {cur}/{len(steps)} steps executed.\n"
+                f"Goal: {plan.get('goal','')}\n"
+                "Use `run workflow` to continue."
+            )
+        if re.match(r"^\s*(run|execute)\s+workflow\s*$", cmd_lower):
+            return self._execute_workflow_plan(max_steps=24)
+        if re.match(r"^\s*(clear|cancel)\s+workflow\s*$", cmd_lower):
+            self.pending_workflow_plan = None
+            return "Cleared pending workflow."
         if re.match(r"^\s*(memory|mem)\s+(status|stats?)\s*$", cmd_lower):
             return self._memory_status_text()
         if re.match(r"^\s*(memory|mem)\s+(on|off)\s*$", cmd_lower):
@@ -11886,6 +15612,43 @@ class WindowsAgent:
             if m_facts:
                 n = max(1, min(50, int(m_facts.group(1))))
             return "Learned facts:\n" + self._memory_facts_text(limit=n)
+        if re.match(r"^\s*(memory|mem)\s+(insights|learning|hermes)(?:\s+\d+)?\s*$", cmd_lower):
+            n = 12
+            m_insights = re.search(r"(\d+)\s*$", cmd_lower)
+            if m_insights:
+                n = max(1, min(50, int(m_insights.group(1))))
+            return "Hermes learning insights:\n" + self._memory_insights_text(limit=n)
+        if re.match(r"^\s*(memory|mem)\s+(recaps|recap|sessions?)(?:\s+\d+)?\s*$", cmd_lower):
+            n = 8
+            m_recaps = re.search(r"(\d+)\s*$", cmd_lower)
+            if m_recaps:
+                n = max(1, min(40, int(m_recaps.group(1))))
+            return "Session recaps:\n" + self._memory_recaps_text(limit=n)
+        if re.match(r"^\s*(outcomes?|tasks?)\s+(status|stats?)\s*$", cmd_lower):
+            return self._task_outcomes_status_text()
+        if re.match(r"^\s*(outcomes?|tasks?)\s+recent(?:\s+\d+)?\s*$", cmd_lower):
+            n = 12
+            m_out = re.search(r"(\d+)\s*$", cmd_lower)
+            if m_out:
+                n = max(1, min(80, int(m_out.group(1))))
+            return "Recent task outcomes:\n" + self._task_outcomes_recent_text(limit=n)
+        if re.match(r"^\s*(trajectory|trajectories|trace)\s+(status|stats?)\s*$", cmd_lower):
+            return self._trajectory_status_text()
+        if re.match(r"^\s*(trajectory|trajectories|trace)\s+recent(?:\s+\d+)?\s*$", cmd_lower):
+            n = 6
+            m_tr = re.search(r"(\d+)\s*$", cmd_lower)
+            if m_tr:
+                n = max(1, min(40, int(m_tr.group(1))))
+            return "Recent trajectories:\n" + self._trajectory_recent_text(limit=n)
+        if re.match(r"^\s*memory\s+safety\s+status\s*$", cmd_lower):
+            return (
+                "Memory safety:\n"
+                f"  - blocked_entries: {int(self.memory_safety_block_count)}\n"
+                "  - policy: injection/exfiltration patterns and invisible unicode are blocked"
+            )
+        if re.match(r"^\s*playbook(?:\s+.+)?\s*$", cmd_lower):
+            target = re.sub(r"^\s*playbook\s*", "", user_input, flags=re.IGNORECASE).strip()
+            return self._playbook_for_query_text(target)
         if re.match(r"^\s*(memory|mem)\s+export\s*$", cmd_lower):
             return self._export_memory_bundle()
         if re.match(r"^\s*(memory|mem)\s+forget\s+last\s*$", cmd_lower):
@@ -11943,7 +15706,7 @@ class WindowsAgent:
         if re.search(r"\b(what'?s\s+up|was\s+up|wassup|how'?s\s+it\s+going|hows\s+it\s+going|hows\s+going\s+on)\b", cmd_lower):
             return "I'm doing well and ready to help. What do you need?"
         
-        # Handle any message containing a URL â use original input to preserve URL case
+        # Handle any message containing a URL Ã¢Â€Â” use original input to preserve URL case
         _urls_in_msg = re.findall(r'https?://[^\s<>"\']+', user_input)
         if not _urls_in_msg and re.search(r"\b(open|visit|read)\b.*\blink\b|\bopen link\b|\blearn more\b", cmd_lower):
             last_url = self._find_last_url_in_history()
@@ -11956,9 +15719,21 @@ class WindowsAgent:
             for _u in _urls_in_msg:
                 _question = _question.replace(_u, '')
             _question = _question.strip(' \t\n\r.,;:!?')
-            return self._handle_url_with_question(url, _question or None)
+            # Strip bare navigation verbs that aren't real questions
+            _bare_nav = re.match(
+                r'^(open|browse|go\s+to|navigate\s+to|visit|load|show\s+me|fetch|read|launch)\s*$',
+                _question, re.IGNORECASE,
+            )
+            if _bare_nav:
+                _question = None
+            # "open <url>" with no real question → just open it in the browser visibly
+            if not _question:
+                if self._open_url_in_browser(url, None):
+                    return f"Opened {url}."
+                return f"Could not open {url}."
+            return self._handle_url_with_question(url, _question)
         
-        # Handle "that's wrong / search from internet / bring from internet" corrections â
+        # Handle "that's wrong / search from internet / bring from internet" corrections Ã¢Â€Â”
         # user is telling the AI its last answer was wrong and wants a real web search.
         # Extract the actual topic from conversation history, not from this complaint message.
         _correction_cues = re.search(
@@ -11988,7 +15763,7 @@ class WindowsAgent:
                         break
             if _last_real_topic:
                 # If the last topic was a screen-vision query (e.g. "what do you see?"),
-                # don't web-search it â just acknowledge the correction.
+                # don't web-search it Ã¢Â€Â” just acknowledge the correction.
                 _screen_query_pat = re.compile(
                     r"\b(what (are|do) you (see|seeing|look at|looking at)|what.?s on (my )?screen"
                     r"|what can you see|describe (my )?screen|read (my )?screen"
@@ -11996,11 +15771,11 @@ class WindowsAgent:
                     re.I,
                 )
                 if _screen_query_pat.search(_last_real_topic):
-                    return "Sorry about that â I may have misread the screen. Could you describe what you actually see, or re-enable Live so I can take another look?"
+                    return "Sorry about that Ã¢Â€Â” I may have misread the screen. Could you describe what you actually see, or re-enable Live so I can take another look?"
                 return self._answer_from_live_web(_last_real_topic)
             else:
-                # Correction cue fired but no prior topic found — ask clearly.
-                return "I understand that was incorrect — could you tell me more specifically what was wrong, or rephrase your question so I can search again?"
+                # Correction cue fired but no prior topic found â€” ask clearly.
+                return "I understand that was incorrect â€” could you tell me more specifically what was wrong, or rephrase your question so I can search again?"
 
         # Handle research requests with browsing
         if re.search(r"\b(research|browse|find info|look up)\b", cmd_lower) and re.search(r"\b(for|about|on)\b", cmd_lower):
@@ -12008,7 +15783,7 @@ class WindowsAgent:
             if topic:
                 return self.browse_and_research(topic)
         
-        # Date/time quick-answers â only for short queries, not documents that contain "date:" fields
+        # Date/time quick-answers Ã¢Â€Â” only for short queries, not documents that contain "date:" fields
         _is_short_query = len(cmd_lower.split()) <= 12 and not _has_write_body
         if _is_short_query and re.search(r"\b(today'?s date|what(?:'s| is)\s+the\s+date|current date)\b", cmd_lower):
             now = datetime.now()
@@ -12022,6 +15797,12 @@ class WindowsAgent:
         ) and not re.search(r"\b(prayer|salat|salah|weather|game|match|ucl|schedule|kickoff|kick.off|local\s+time|start\s+time|match\s+time)\b", cmd_lower):
             now = datetime.now()
             return f"The current time is {now.strftime('%H:%M:%S')}."
+        if self._is_greeting_location_query(user_input):
+            return self._greeting_location_help_text()
+        if _is_short_query and self._is_reassurance_followup(cmd_lower):
+            _reassure = self._handle_reassurance_followup()
+            if _reassure:
+                return _reassure
         if (
             re.search(r"\b(research|reserach|reseach|resarch|search)\b", cmd_lower)
             and re.search(r"\b(internet|web|online)\b", cmd_lower)
@@ -12055,7 +15836,46 @@ class WindowsAgent:
         if re.search(r"\b(weather)\b", cmd_lower) and re.search(r"\b(now|right now|today|next)\b", cmd_lower):
             hrs = 12 if re.search(r"\bnext\s+12\b", cmd_lower) else 12
             return self._get_weather_now_and_next_hours(user_input, hours=hrs)
-        # ── FAST-PATH GUARD: PDF/Word creation bypasses ALL web-research routing ──────
+        # â”€â”€ CHAT MODE GATE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        # All handlers below this point execute desktop/system tasks: doc creation,
+        # app launching, navigation, file ops, system controls, screen automation.
+        # In chat mode NONE of these must ever run â€” every message goes straight to
+        # the LLM. Web search, conversation, and research are handled internally by
+        # intelligent_respond's own routing.
+        # ── CONVERSATIONAL GATE (chat mode + non-task messages in task mode) ───
+        # Chat mode: ALL messages go to intelligent_respond — no task handlers.
+        # Task mode: conversational messages (questions, analysis, discussion) also
+        # go to intelligent_respond; only genuine task commands reach the handlers below.
+        _is_task_command = bool(re.search(
+            r'\b(open|launch|start|run|close|kill|quit|exit|minimize|maximise|maximize|restore'
+            r'|click|type|press|scroll|drag|move\s+(?:to|the\s+cursor)|screenshot|screen\s+shot'
+            r'|capture\s+(?:screen|window)|take\s+(?:a\s+)?screenshot'
+            r'|create|make|write|save|generate|build|produce|export|convert'
+            r'|navigate|go\s+to|open\s+(?:folder|directory|path|file)'
+            r'|search\s+(?:for\s+)?(?:files?|folder|document)|find\s+(?:file|folder|document)'
+            r'|set\s+(volume|brightness|alarm|timer|reminder)'
+            r'|install|uninstall|download|upload'
+            r'|send\s+(?:an?\s+)?(?:email|message|mail)'
+            r'|schedule|remind\s+me|set\s+(?:an?\s+)?(?:alarm|reminder|timer)'
+            r'|turn\s+(?:on|off)|enable|disable|toggle'
+            r'|copy|paste|move|delete|rename|zip|extract|compress)\b',
+            cmd_lower,
+        ))
+        if _input_mode == "chat" or (_input_mode == "task" and not _is_task_command):
+            _fup = self._get_followup_context(user_input)
+            # Keep original wording for follow-ups; context is provided via system hint.
+            _chat_input = user_input
+            _chat_msgs = self._build_standard_messages(_chat_input)
+            if _fup:
+                # Inject follow-up hint so the LLM knows this continues the last topic
+                _chat_msgs.insert(-1, {"role": "system", "content": _fup})
+            _chat_answer = self.intelligent_respond(
+                _chat_input, messages=_chat_msgs, has_live_screen=bool(shared_screen_path)
+            )
+            self._capture_turn(user_input, _chat_answer, remember=True)
+            return _chat_answer
+
+        # â”€â”€ FAST-PATH GUARD: PDF/Word creation bypasses ALL web-research routing â”€â”€â”€â”€â”€â”€
         # This runs before _should_force_universal_web_research and _should_auto_web_research
         # to ensure doc-creation commands NEVER reach web search, regardless of any edge
         # case in the individual gate functions.
@@ -12089,7 +15909,7 @@ class WindowsAgent:
             _dbg_log.debug(f'  fast-path _fast_word={repr(str(_fast_word)[:80]) if _fast_word is not None else None}')
             if _fast_word is not None:
                 return _fast_word
-            # ── Secondary fast-path fallback (authorized only) ──────────────────
+            # â”€â”€ Secondary fast-path fallback (authorized only) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # Both handlers returned None. If user is authorized, handle directly.
             if allow_sensitive_fs:
                 _sp_fb_last_pat = re.compile(
@@ -12120,15 +15940,21 @@ class WindowsAgent:
                 elif _sp_inline_m:
                     _sp_content = _sp_inline_m.group(1).strip()
                 else:
+                    # Only grab last AI response if command explicitly asks for a document type
+                    _sp_wants_doc = bool(re.search(
+                        r'\b(pdf|\.pdf|docx?|word|txt|text\s+file|note|pptx?|presentation|xlsx?|spreadsheet)\b',
+                        cmd_lower,
+                    ))
                     _sp_content = ''
-                    for _sp_hist in [list(getattr(self, 'task_conversation_history', [])), list(getattr(self, 'conversation_history', []))]:
-                        for _sp_msg in reversed(_sp_hist):
-                            _sp_ai = (_sp_msg.get('assistant') or _sp_msg.get('content') or '').strip()
-                            if _sp_ai:
-                                _sp_content = self._strip_ai_sources(_sp_ai)
+                    if _sp_wants_doc:
+                        for _sp_hist in [list(getattr(self, 'task_conversation_history', [])), list(getattr(self, 'conversation_history', []))]:
+                            for _sp_msg in reversed(_sp_hist):
+                                _sp_ai = (_sp_msg.get('assistant') or _sp_msg.get('content') or '').strip()
+                                if _sp_ai:
+                                    _sp_content = self._strip_ai_sources(_sp_ai)
+                                    break
+                            if _sp_content:
                                 break
-                        if _sp_content:
-                            break
                 if _sp_content:
                     _sp_desktop = os.path.join(os.path.expanduser('~'), 'Desktop')
                     _sp_nm = re.search(r'\b(?:called|named)\s+["\']?([^"\',:]+?)["\']?\s*$', user_input, re.IGNORECASE)
@@ -12186,7 +16012,7 @@ class WindowsAgent:
                     if _sp_reply is not None:
                         _dbg_log.debug(f'  secondary fast-path fallback reply={repr(str(_sp_reply)[:80])}')
                         return _sp_reply
-        # ── END FAST-PATH GUARD ──────────────────────────────────────────────────────
+        # â”€â”€ END FAST-PATH GUARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
         if self._should_force_universal_web_research(user_input, cmd_lower):
             topic = self._extract_research_topic(user_input) or user_input
@@ -12227,7 +16053,7 @@ class WindowsAgent:
         ))
         # _has_write_body already set near top of process_command
         # Extension-filtered file listing: "list png on desktop", "show .pdf files"
-        # Only scan first 80 chars â avoids matching extensions buried in user-written content
+        # Only scan first 80 chars Ã¢Â€Â” avoids matching extensions buried in user-written content
         _cmd_head = cmd_lower[:80]
         ext_filter_m = re.search(
             r'\b(png|jpg|jpeg|gif|svg|ico|avif|pdf|txt|doc|docx|xls|xlsx|csv|mp4|mp3|mp4|zip|rar|py|js|ts|html|exe|lnk)\b',
@@ -12298,7 +16124,7 @@ class WindowsAgent:
                     return "\n\n".join(sections)
 
         # Combined inventory intent: "list apps and desktop items".
-        # Guard: skip for file/doc creation commands â content body often contains words
+        # Guard: skip for file/doc creation commands Ã¢Â€Â” content body often contains words
         # like "list", "app", "desktop", "running" that describe capabilities, not inventory requests.
         if not is_creation_cmd and not _has_write_body:
             if re.search(r"\b(list|show|see|give me)\b", cmd_lower) and re.search(r"\bdesktop\b", cmd_lower) and re.search(r"\bapps?\b", cmd_lower):
@@ -12316,11 +16142,11 @@ class WindowsAgent:
                 return "Installed but not running:\n" + "\n".join([f"  - {a}" for a in closed]) if closed else "I couldn't identify closed apps."
 
         rewritten_for_file = self._rewrite_natural_desktop_file_command(user_input)
-        # Rename/move/delete always operate on Desktop items â always allow Desktop access
+        # Rename/move/delete always operate on Desktop items Ã¢Â€Â” always allow Desktop access
         _is_rename_move = bool(re.match(r"^(?:rename|move|put|place|delete|remove|copy)\b", cmd_lower.strip()))
         allow_desktop_for_file = allow_sensitive_fs or self._is_non_sensitive_desktop_query(rewritten_for_file) or _is_rename_move
 
-        # Word document creation â must run before general file handler
+        # Word document creation Ã¢Â€Â” must run before general file handler
         pdf_reply = self._handle_pdf_command(
             user_input,
             allow_desktop=True,
@@ -12420,15 +16246,38 @@ class WindowsAgent:
                 )
             return self.search_web_on_app(search_query, search_app)
 
+        # ── Playwright browse: "browse/read/open [url] with playwright / in browser / show me" ──
+        _pw_browse_m = re.search(
+            r"(?:browse|read|open|show\s+me|fetch|load)\s+(https?://\S+|www\.\S+)",
+            cmd_lower,
+        )
+        if not _pw_browse_m:
+            _pw_browse_m = re.search(
+                r"(https?://\S+|www\.\S+)\s+(?:with\s+playwright|in\s+(?:the\s+)?browser|show\s+me|open\s+it|load\s+it)",
+                cmd_lower,
+            )
+        if _pw_browse_m and sync_playwright is not None:
+            _pw_url = _pw_browse_m.group(1)
+            if not _pw_url.startswith("http"):
+                _pw_url = "https://" + _pw_url
+            result = self.open_and_read_url(_pw_url)
+            return result or f"Could not open {_pw_url}."
+
         # Website navigation intent (go to X on browser).
         destination, browser_hint = self._extract_navigation_intent(normalized_user_input or user_input)
         if destination:
             url = self._normalize_destination_to_url(destination)
             if url and self._open_url_in_browser(url, browser_hint):
-                if browser_hint:
-                    return f"Opened {destination} on {browser_hint}."
-                return f"Opened {destination}."
-            return f"Could not navigate to {destination}."
+                msg = f"Opened {destination} on {browser_hint}." if browser_hint else f"Opened {destination}."
+                self._record_task_outcome("open_url", "success", reason=msg, details={"destination": destination, "browser": browser_hint or ""})
+                return msg
+            fail_msg = f"Could not navigate to {destination}."
+            self._record_task_outcome("open_url", "failed", reason=fail_msg, details={"destination": destination, "browser": browser_hint or ""})
+            if self._autonomy_policy().get("mode") == "autonomous":
+                recovered = self._attempt_recovery_chain("open_url", f"open {destination}", fail_msg)
+                if recovered:
+                    return recovered
+            return self._maybe_attach_failure_playbook(fail_msg, action_hint="open_url", details={"destination": destination, "browser": browser_hint or ""})
 
         action, natural_target = self._extract_app_action(normalized_user_input or user_input)
 
@@ -12457,8 +16306,23 @@ class WindowsAgent:
                 )
                 return "Authorization required before closing apps.\n" + prompt
             result = self.close_app(target)
-            return result or f"Could not close {target}"
+            msg = result or f"Could not close {target}"
+            if result:
+                self._record_task_outcome("close_app", "success", reason=msg, details={"target": target})
+                return msg
+            self._record_task_outcome("close_app", "failed", reason=msg, details={"target": target})
+            if self._autonomy_policy().get("mode") == "autonomous":
+                recovered = self._attempt_recovery_chain("close_app", f"close {target}", msg)
+                if recovered:
+                    return recovered
+            return self._maybe_attach_failure_playbook(msg, action_hint="close_app", details={"target": target})
         # Prioritize launcher commands before status-intent parsing.
+        # When Playwright browser is active, "open X" / "click X" should operate on the page, not launch apps.
+        if self._pw_page is not None and re.match(r'^(?:open|click)\s+', cmd_lower.strip()):
+            _pw_target = re.sub(r'^(?:open|click)\s+(?:on\s+)?(?:the\s+)?', '', cmd_lower.strip()).strip(' "\'')
+            if _pw_target:
+                _r = self._pw_send("click", _pw_target)
+                return _r
         if action == "open" or cmd_lower.strip().startswith("open ") or cmd_lower.strip().startswith("launch "):
             if re.search(r"\bsearch\b", cmd_lower):
                 q, app = self._extract_search_intent(normalized_user_input or user_input)
@@ -12481,15 +16345,23 @@ class WindowsAgent:
             self._audit("open_app", "requested", {"target": target})
             opened = self.open_app(target)
             if opened:
+                self._record_task_outcome("open_app", "success", reason=opened, details={"target": target})
                 return opened
             suggestion = self._suggest_open_target(target)
             if suggestion:
+                self._record_task_outcome("open_app", "pending", reason=f"suggestion:{suggestion}", details={"target": target, "suggestion": suggestion})
                 return self._set_pending_confirmation(
                     "open_app",
                     {"target": suggestion},
                     f"I couldn't confidently match '{target}'. Do you want me to open '{suggestion}'? (yes/no)",
                 )
-            return f"Could not open {target}"
+            msg = f"Could not open {target}"
+            self._record_task_outcome("open_app", "failed", reason=msg, details={"target": target})
+            if self._autonomy_policy().get("mode") == "autonomous":
+                recovered = self._attempt_recovery_chain("open_app", f"open {target}", msg)
+                if recovered:
+                    return recovered
+            return self._maybe_attach_failure_playbook(msg, action_hint="open_app", details={"target": target})
 
         short_query = re.sub(r"[?!.,]+$", "", cmd_lower).strip()
         if short_query and len(short_query.split()) <= 3 and short_query not in {"hello", "hi", "hey"}:
@@ -12594,7 +16466,7 @@ class WindowsAgent:
         )
         if _asking_screen and not self.screen_sharing_active:
             return (
-                "Screen sharing is currently **off** â I can't see your screen. "
+                "Screen sharing is currently **off** Ã¢Â€Â” I can't see your screen. "
                 "Click the **Live** button in the chat window to enable it, then ask again."
             )
 
@@ -12612,7 +16484,7 @@ class WindowsAgent:
             _cm = re.search(r'[:\-]\s*(.{10,})$', user_input, re.DOTALL)
             if _cm:
                 _clarify_content = _cm.group(1).strip()[:120]
-            _preview = (f' with content: "{_clarify_content[:80]}â¦"') if _clarify_content else ""
+            _preview = (f' with content: "{_clarify_content[:80]}Ã¢Â€Â¦"') if _clarify_content else ""
             return self._set_pending_confirmation(
                 "create_word_doc_clarify",
                 {"user_input": user_input},
@@ -12626,6 +16498,9 @@ class WindowsAgent:
             recent = [] if lightweight_ctx else self.conversation_history[-3:]
             relevant = [] if lightweight_ctx else self._retrieve_relevant_memory(user_input, limit=5)
             relevant_facts = [] if lightweight_ctx else self._retrieve_relevant_facts(user_input, limit=6)
+            hermes_learning_context = "" if lightweight_ctx else self._build_hermes_learning_context(user_input)
+            recap_context = "" if lightweight_ctx else self._build_session_recap_context(user_input, limit=2)
+            trajectory_context = "" if lightweight_ctx else self._build_trajectory_context(user_input, limit=2)
             include_live_state = self._should_include_live_state_context(user_input)
             if lightweight_ctx:
                 include_live_state = False
@@ -12652,61 +16527,59 @@ class WindowsAgent:
                             "## Active mode: TASK\n"
                             "The user is in Task mode. Focus exclusively on executing desktop tasks: "
                             "opening/closing apps, creating files/folders/documents, automation, screen control. "
-                            "Do NOT give long conversational answers — confirm the task was done or ask only what is needed to do it.\n\n"
+                            "Do NOT give long conversational answers â€” confirm the task was done or ask only what is needed to do it.\n\n"
                             if _input_mode == "task" else
                             "## Active mode: CHAT\n"
                             "The user is in Chat mode. Focus on conversation, answering questions, web search, and general knowledge. "
                             "Do not initiate file system changes unless explicitly asked.\n\n"
                         )
-                        + "## IDENTITY — read this first\n"
-                        "**YOU ARE OPUNTIA** — a full-featured Windows desktop AI agent created by the Opuntia Team. "
-                        "You are NOT a general-purpose chatbot. You are NOT 'just a conversational AI'. "
-                        "You are a smart autonomous Windows agent that can control the PC, search the web, create files, automate tasks, and much more. "
-                        "Whenever you introduce yourself or someone asks who you are, ALWAYS describe yourself as a Windows desktop AI agent.\n\n"
+                        + "## IDENTITY â€” read this first\n"
+                        "**YOU ARE OPUNTIA** â€” an intelligent Windows desktop AI agent engineered by the Opuntia Team. "
+                        "Opuntia is purpose-built to operate on Windows: automating workflows, controlling the PC, searching the web in real time, generating professional documents, and reasoning over complex tasks. "
+                        "Whenever you introduce yourself or someone asks who you are, present yourself with confidence and precision as a professional Windows desktop AI agent.\n\n"
                         "## What you can do\n"
-                        "Opuntia's built-in capabilities:\n"
-                        "- **Desktop automation**: open and close any app, click on screen elements, type text, press keyboard shortcuts, move/resize windows\n"
-                        "- **App management**: list running apps, focus a window, switch between apps, kill processes\n"
-                        "- **Real-time web search**: retrieve live news, prices, scores, current events from the internet\n"
-                        "- **URL browsing**: open any URL, read and summarize its content, answer questions about web pages\n"
-                        "- **Weather**: get current weather and forecasts for any city\n"
-                        "- **Prayer times**: get daily Islamic prayer times for any city/country\n"
-                        "- **File & folder management**: create, read, move, copy, delete files and folders; list directory contents\n"
-                        "- **Screen capture & vision**: take a screenshot, analyze what's on screen, answer questions about screen content\n"
-                        "- **Voice input**: listen to the microphone and transcribe speech (supports English, French, Arabic)\n"
-                        "- **Memory & learning**: remember facts across conversations, store learned information persistently\n"
-                        "- **Skills system**: extensible automation skills that can be added and customized\n"
-                        "- **System controls**: adjust volume, screen brightness, toggle WiFi and Bluetooth, lock/sleep the PC\n"
-                        "- **Calculator & conversions**: math calculations, unit conversions, date/time math\n"
-                        "- **Powered by advanced AI**: uses state-of-the-art language models for understanding and generation\n\n"
-                        "- **Document & file generation**: create PDF, Word, Excel, PowerPoint with professional layouts\n"
-                        "- **Memory & learning**: remember facts across conversations, store learned information persistently\n\n"
+                        "Opuntia's core capabilities:\n"
+                        "- **Desktop automation**: launch and close applications, simulate clicks, keystrokes, and keyboard shortcuts, control windows\n"
+                        "- **App & process management**: list running processes, switch focus between windows, terminate applications\n"
+                        "- **Real-time web search**: retrieve live news, current prices, scores, and up-to-date information from the internet\n"
+                        "- **URL browsing**: open any URL, read and summarize web page content, answer questions about pages\n"
+                        "- **Weather**: retrieve current conditions and multi-day forecasts for any location worldwide\n"
+                        "- **File & folder management**: create, read, move, copy, rename, and delete files and folders; browse directory trees\n"
+                        "- **Screen capture & vision**: take screenshots, visually analyze on-screen content, and answer questions about what is displayed\n"
+                        "- **Voice input**: transcribe microphone speech in real time (English, French, Arabic)\n"
+                        "- **Document generation**: produce professional PDF, Word, Excel, and PowerPoint files with structured layouts\n"
+                        "- **Data & analytics**: load CSV/Excel files, compute statistics, generate charts (bar, line, pie, scatter, heatmap), export formatted Excel reports\n"
+                        "- **Memory & learning**: retain facts across conversations and recall them in future sessions\n"
+                        "- **Skills system**: modular, extensible automation skills that can be added and customized\n"
+                        "- **System controls**: adjust volume and brightness, toggle WiFi and Bluetooth, lock or sleep the PC\n"
+                        "- **Calculator & conversions**: perform math, unit conversions, and date/time calculations\n"
+                        "- **Advanced AI reasoning**: powered by state-of-the-art language models for nuanced understanding and generation\n\n"
                         "When asked about your own features, capabilities, or what you can do -- answer from the description above. Do NOT search the internet for information about yourself.\n\n"
                         "When COMPARING yourself to another AI tool (ChatGPT, Claude, Gemini, Copilot, etc.): "
                         "1) Describe YOURSELF accurately as a Windows desktop AI agent using the capabilities list above. "
-                        "2) For the OTHER tool — if web search results are in context, use them. If not, describe what you know from training data and be honest if your knowledge is limited. "
-                        "3) NEVER describe Opuntia as a 'general-purpose chatbot' or 'conversational AI' — you are a Windows desktop automation agent. "
+                        "2) For the OTHER tool â€” if web search results are in context, use them. If not, describe what you know from training data and be honest if your knowledge is limited. "
+                        "3) NEVER describe Opuntia as a 'general-purpose chatbot' or 'conversational AI' â€” you are a Windows desktop automation agent. "
                         "4) NEVER invent or hallucinate facts about ANY AI product. "
                         "5) Use a Markdown comparison table to structure the differences.\n\n"
                         "## How you access knowledge (two-mode system)\n"
-                        "**Mode 1 â Training data (built-in knowledge):** You were trained on a large text dataset with a knowledge cutoff of August 2025. "
+                        "**Mode 1 Ã¢Â€Â” Training data (built-in knowledge):** You were trained on a large text dataset with a knowledge cutoff of August 2025. "
                         "Use this for timeless facts, stable concepts, history, science, math, definitions, and anything unlikely to have changed.\n"
-                        "**Mode 2 â Live web search:** When the context contains web search results (marked as live data), use those results as your primary source. "
-                        "You have real search tools that retrieve current information â news, prices, scores, who currently holds a position, recent events.\n\n"
+                        "**Mode 2 Ã¢Â€Â” Live web search:** When the context contains web search results (marked as live data), use those results as your primary source. "
+                        "You have real search tools that retrieve current information Ã¢Â€Â” news, prices, scores, who currently holds a position, recent events.\n\n"
                         "## Answering rules\n"
                         "1. If live web results are in the context: answer from those results, cite sources [1][2] etc.\n"
-                        "2. **Unknown person, place, or entity in your training data ? do NOT ask for more context. The internet search has already been performed â use those results to answer directly.**\n"
+                        "2. **Unknown person, place, or entity in your training data ? do NOT ask for more context. The internet search has already been performed Ã¢Â€Â” use those results to answer directly.**\n"
                         "3. **Even when you know something from training data ? combine it with live web results to verify and give a more complete, current answer.**\n"
-                        "4. NEVER say 'I don't have information about X' â live search results are provided in context, use them.\n"
-                        "5. NEVER say you cannot browse the internet â you have live search capability.\n"
+                        "4. NEVER say 'I don't have information about X' Ã¢Â€Â” live search results are provided in context, use them.\n"
+                        "5. NEVER say you cannot browse the internet Ã¢Â€Â” you have live search capability.\n"
                         "6. NEVER say 'shutting down' or 'goodbye' unless the user explicitly says 'close yourself' or 'exit app'.\n"
                         "7. **Structure your answer**: direct answer first -> supporting details -> sources. Use ## headings for multi-section answers, bullet points for 3+ items. "
-                        "**MANDATORY: When comparing 2 or more things (tools, products, concepts, people), you MUST use a Markdown table** — format: | Feature | Item1 | Item2 | with a header row, a separator row (|---|---|---|), and data rows. NEVER use bullet points for comparisons — ALWAYS use a table.\n"
+                        "**MANDATORY: When comparing 2 or more things (tools, products, concepts, people), you MUST use a Markdown table** â€” format: | Feature | Item1 | Item2 | with a header row, a separator row (|---|---|---|), and data rows. NEVER use bullet points for comparisons â€” ALWAYS use a table.\n"
                         "8. **Adapt depth to the question**: simple query = 1-3 sentence answer; technical/complex query = full structured breakdown with sections and examples.\n"
                         "9. **Bold** key facts, names, numbers. No filler phrases like 'Great question!', 'Certainly!', 'Based on the information provided'.\n"
                         "10. For age/date calculations, use the current date shown above.\n"
-                        "11. FOLLOW-UP RESOLUTION — CRITICAL: Short queries with words like 'numbers', 'data', 'statistics', 'more', 'details', 'examples', 'specific', 'exact', 'info', 'update', 'latest' are ALWAYS follow-ups about the LAST topic discussed — never treat them as new standalone questions. Example: after discussing 'Claude AI vs ChatGPT users', 'give me numbers data of 2026' = 'give me the 2026 user numbers about Claude AI vs ChatGPT'. NEVER respond with generic date/time data just because a year number appears in a follow-up. Check CONVERSATION HISTORY above for the active topic.\n"
-                        "12. NEVER write '[Searching...]', 'Let me check the web', 'Let me search for you', 'I'll look that up' in your answer. The search is already done — just give the result.\n"
+                        "11. FOLLOW-UP RESOLUTION â€” CRITICAL: Short queries with words like 'numbers', 'data', 'statistics', 'more', 'details', 'examples', 'specific', 'exact', 'info', 'update', 'latest' are ALWAYS follow-ups about the LAST topic discussed â€” never treat them as new standalone questions. Example: after discussing 'Claude AI vs ChatGPT users', 'give me numbers data of 2026' = 'give me the 2026 user numbers about Claude AI vs ChatGPT'. NEVER respond with generic date/time data just because a year number appears in a follow-up. Check CONVERSATION HISTORY above for the active topic.\n"
+                        "12. NEVER write '[Searching...]', 'Let me check the web', 'Let me search for you', 'I'll look that up' in your answer. The search is already done â€” just give the result.\n"
                     ),
                 }
             ]
@@ -12734,12 +16607,12 @@ class WindowsAgent:
                 live_screen_rules = (
                     "LIVE SCREEN MODE is active. You can see the user's screen in real time via the LIVE SCREEN context above.\n"
                     "Respond like a smart assistant on a screen-share call:\n"
-                    "- Use sections with emoji headers: ??? Active App, ?? Layout & Activity, ?? Insights â ONLY when the user explicitly asks you to describe or explain what you see.\n"
+                    "- Use sections with emoji headers: ??? Active App, ?? Layout & Activity, ?? Insights Ã¢Â€Â” ONLY when the user explicitly asks you to describe or explain what you see.\n"
                     "- For all other questions, answer the question directly. Reference the screen only if it's relevant.\n"
                     "- Do NOT re-describe the screen when the user asks a content question (e.g. 'explain this code', 'what are the limitations').\n"
                     "- Mention errors, warnings, or notable things visible on screen only when relevant.\n"
                     "- Suggest helpful next steps when appropriate.\n"
-                    "- Do NOT say 'I cannot see your screen' â you CAN see it."
+                    "- Do NOT say 'I cannot see your screen' Ã¢Â€Â” you CAN see it."
                 )
                 if brevity_cue:
                     live_screen_rules += (
@@ -12767,16 +16640,45 @@ class WindowsAgent:
                         }
                     )
             if shared_screen_path:
-                # In live mode, always analyze the screen â AI sees everything like a human
+                # In live mode, always analyze the screen Ã¢Â€Â” AI sees everything like a human
                 screen_context = self._describe_screen_snapshot(shared_screen_path, user_input)
                 if screen_context:
-                    label = "LIVE SCREEN â what is currently on the user's screen:\n" if not screen_task_intent else "LIVE SCREEN (task execution context):\n"
+                    # Step 4: PII redaction -- scrub element-level PII before sending to LLM
+                    if (scan_elements_for_pii is not None and redact_text is not None
+                            and self._last_elements is not None):
+                        try:
+                            _pii_matches = scan_elements_for_pii(self._last_elements.elements)
+                            if _pii_matches:
+                                screen_context = redact_text(screen_context, _pii_matches)
+                        except Exception:
+                            pass
+                    label = "LIVE SCREEN Ã¢Â€Â” what is currently on the user's screen:\n" if not screen_task_intent else "LIVE SCREEN (task execution context):\n"
                     messages.append(
                         {
                             "role": "system",
                             "content": label + screen_context[:4500],
                         }
                     )
+                    # Step 5: Structured element context -- give LLM element IDs for precise targeting
+                    if self._last_elements is not None:
+                        try:
+                            _elem_lines = []
+                            for _el in self._last_elements.elements[:40]:
+                                _act_str = ",".join(_el.actions) if _el.actions else ""
+                                _elem_lines.append(
+                                    f"  [{_el.id}] {_el.control_type} \"{_el.label}\" actions=[{_act_str}]"
+                                )
+                            if _elem_lines:
+                                messages.append({
+                                    "role": "system",
+                                    "content": (
+                                        "STRUCTURED UI ELEMENTS -- reference these IDs for precise actions "
+                                        "(e.g. smart_click('btn_save') instead of raw coordinates):\n"
+                                        + "\n".join(_elem_lines)
+                                    ),
+                                })
+                        except Exception:
+                            pass
             if live_web_context:
                 messages.append(
                     {
@@ -12791,6 +16693,12 @@ class WindowsAgent:
                 messages.append({"role": "system", "content": profile_prompt})
             if facts_context:
                 messages.append({"role": "system", "content": facts_context[:900]})
+            if hermes_learning_context:
+                messages.append({"role": "system", "content": hermes_learning_context[:900]})
+            if recap_context:
+                messages.append({"role": "system", "content": recap_context[:900]})
+            if trajectory_context:
+                messages.append({"role": "system", "content": trajectory_context[:1000]})
             skills_context = "" if lightweight_ctx else self._enabled_skills_prompt_for_query(user_input)
             if skills_context:
                 messages.append({"role": "system", "content": skills_context})
@@ -12798,13 +16706,16 @@ class WindowsAgent:
             for ex in few_shot:
                 messages.append({"role": "user", "content": ex["user"]})
                 messages.append({"role": "assistant", "content": ex["assistant"]})
-            # ── Follow-up context injection ───────────────────────────────────
+            # â”€â”€ Follow-up context injection â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # When the user sends a short metric/data follow-up ("give me numbers
             # data of 2026"), the LLM can misinterpret it as a standalone question.
             # Inject an explicit hint so it understands this continues the last topic.
             _followup_hint = self._get_followup_context(user_input)
             if _followup_hint:
                 messages.append({"role": "system", "content": _followup_hint})
+            _anchor_hint = self._topic_anchor_hint(user_input)
+            if _anchor_hint:
+                messages.append({"role": "system", "content": _anchor_hint})
             # Add the actual user message last so the AI knows what to respond to
             messages.append({"role": "user", "content": user_input})
             # === INTELLIGENT ROUTING: Internal Knowledge vs Internet Search ===
@@ -12825,7 +16736,7 @@ class WindowsAgent:
             elif not screen_task_intent:
                 self.last_screen_action_plan = None
 
-            # ── Uncertainty retry ─────────────────────────────────────────────
+            # â”€â”€ Uncertainty retry â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             # If the AI answered with hedged/unknown phrases AND this was NOT
             # already a web-search path, automatically retry with a live search.
             _uncertainty_phrases = [
@@ -12854,7 +16765,7 @@ class WindowsAgent:
                 except Exception:
                     pass
 
-            self._remember_turn(user_input, answer)
+            self._capture_turn(user_input, answer, remember=True)
             return answer
         except Exception as e:
             return f"Error: {str(e)}"
